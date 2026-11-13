@@ -1,0 +1,28 @@
+[package]
+name = "ui"
+description = "Zero-dependency native desktop webview and binary IPC library for Rust"
+keywords = ["webview", "gui", "desktop", "ipc", "webkit"]
+categories = ["gui"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+cef = ["dep:ui-cef-sys"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ui-cef-sys = { version = "0.1.0", path = "../ui-cef-sys", optional = true }
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+ui-cef-sys = { version = "0.1.0", path = "../ui-cef-sys" }
+
+[[test]]
+name = "conformance"
+harness = false

@@ -1,0 +1,18 @@
+[package]
+name = "ui-pack"
+description = "Zero-dependency desktop application bundle packager for ui apps"
+keywords = ["bundler", "macos", "desktop", "webview"]
+categories = ["development-tools"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ui-pack"
+path = "src/main.rs"

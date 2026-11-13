@@ -1,0 +1,14 @@
+[package]
+name = "ui-cef-sys"
+description = "Pure C-ABI bindings and build-time staging for Spotify Chromium Embedded Framework (CEF)"
+keywords = ["cef", "ffi", "webview", "chromium"]
+categories = ["external-ffi-bindings"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
