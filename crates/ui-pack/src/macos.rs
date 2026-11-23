@@ -20,6 +20,9 @@ pub struct MacPackOptions {
     /// Code-signing identity; `"-"` signs ad hoc. `None` signs ad hoc only
     /// when the manifest names `entitlements`.
     pub sign: Option<String>,
+    /// `notarytool` keychain profile: notarize and staple after signing.
+    /// Needs a Developer ID `sign` identity.
+    pub notarize: Option<String>,
 }
 
 pub fn render_info_plist(meta: &AppMetadata, executable: &str) -> String {
@@ -77,7 +80,10 @@ fn render_plist_extras(meta: &AppMetadata) -> String {
         ));
         out.push_str("      <key>CFBundleURLSchemes</key>\n      <array>\n");
         for scheme in &meta.url_schemes {
-            out.push_str(&format!("        <string>{}</string>\n", xml_escape(scheme)));
+            out.push_str(&format!(
+                "        <string>{}</string>\n",
+                xml_escape(scheme)
+            ));
         }
         out.push_str("      </array>\n    </dict>\n  </array>\n");
     }
@@ -95,7 +101,10 @@ fn render_plist_extras(meta: &AppMetadata) -> String {
         out.push_str("  </array>\n");
     }
     if let Some(icon) = meta.icon.as_deref().filter(|i| i.ends_with(".icns")) {
-        let file = Path::new(icon).file_name().and_then(|f| f.to_str()).unwrap_or(icon);
+        let file = Path::new(icon)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(icon);
         out.push_str(&format!(
             "  <key>CFBundleIconFile</key>\n  <string>{}</string>\n",
             xml_escape(file)
@@ -114,7 +123,10 @@ pub fn codesign(path: &Path, identity: &str, entitlements: Option<&Path>) -> Res
     if identity != "-" {
         cmd.args(["--options", "runtime", "--timestamp"]);
     }
-    let status = cmd.arg(path).status().map_err(|e| format!("spawn codesign: {e}"))?;
+    let status = cmd
+        .arg(path)
+        .status()
+        .map_err(|e| format!("spawn codesign: {e}"))?;
     if status.success() {
         Ok(())
     } else {
@@ -122,9 +134,77 @@ pub fn codesign(path: &Path, identity: &str, entitlements: Option<&Path>) -> Res
     }
 }
 
-/// The manifest's `entitlements` file, resolved against the manifest folder.
+/// The entitlements to sign with: the manifest's `entitlements` file, or the
+/// inline `[package.metadata.ui.entitlements]` table written to a temp file.
 pub fn entitlements_path(meta: &AppMetadata) -> Option<PathBuf> {
-    meta.entitlements.as_ref().map(|e| meta.manifest_dir.join(e))
+    if let Some(e) = &meta.entitlements {
+        return Some(meta.manifest_dir.join(e));
+    }
+    if meta.entitlement_keys.is_empty() {
+        return None;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "ui-pack-{}-{}.entitlements",
+        meta.crate_name,
+        std::process::id()
+    ));
+    fs::write(&path, render_entitlements(&meta.entitlement_keys)).ok()?;
+    Some(path)
+}
+
+/// An entitlements plist from `(key, enabled)` pairs.
+pub fn render_entitlements(keys: &[(String, bool)]) -> String {
+    let mut body = String::new();
+    for (k, on) in keys {
+        body.push_str(&format!(
+            "  <key>{}</key>\n  <{}/>\n",
+            xml_escape(k),
+            if *on { "true" } else { "false" }
+        ));
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n{body}</dict>\n</plist>\n"
+    )
+}
+
+/// The commands that notarize and staple `app` (zip, submit and wait, staple).
+pub fn notarize_commands(app: &Path, profile: &str) -> Vec<Vec<String>> {
+    let zip = app.with_extension("zip");
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    vec![
+        vec![
+            "ditto".into(),
+            "-c".into(),
+            "-k".into(),
+            "--keepParent".into(),
+            s(app),
+            s(&zip),
+        ],
+        vec![
+            "xcrun".into(),
+            "notarytool".into(),
+            "submit".into(),
+            s(&zip),
+            "--keychain-profile".into(),
+            profile.into(),
+            "--wait".into(),
+        ],
+        vec!["xcrun".into(), "stapler".into(), "staple".into(), s(app)],
+    ]
+}
+
+fn notarize(app: &Path, profile: &str) -> Result<(), String> {
+    for cmd in notarize_commands(app, profile) {
+        let status = std::process::Command::new(&cmd[0])
+            .args(&cmd[1..])
+            .status()
+            .map_err(|e| format!("run {}: {e}", cmd[0]))?;
+        if !status.success() {
+            return Err(format!("`{}` failed", cmd.join(" ")));
+        }
+    }
+    let _ = fs::remove_file(app.with_extension("zip"));
+    Ok(())
 }
 
 pub fn render_sandbox_entitlements() -> &'static str {
@@ -228,8 +308,14 @@ pub fn pack_macos_app(meta: &AppMetadata, opts: &MacPackOptions) -> Result<PathB
             .sign
             .clone()
             .or_else(|| entitlements.as_ref().map(|_| "-".to_owned()));
-        if let Some(identity) = identity {
-            codesign(&app_dir, &identity, entitlements.as_deref())?;
+        if let Some(identity) = &identity {
+            codesign(&app_dir, identity, entitlements.as_deref())?;
+        }
+        if let Some(profile) = &opts.notarize {
+            match identity.as_deref() {
+                Some(id) if id != "-" => notarize(&app_dir, profile)?,
+                _ => return Err("--notarize needs a Developer ID identity in --sign".into()),
+            }
         }
     }
 

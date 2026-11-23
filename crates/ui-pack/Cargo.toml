@@ -16,3 +16,7 @@ workspace = true
 [[bin]]
 name = "ui-pack"
 path = "src/main.rs"
+
+[[bin]]
+name = "cargo-ui"
+path = "src/bin/cargo-ui.rs"

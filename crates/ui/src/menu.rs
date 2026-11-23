@@ -4,9 +4,13 @@ use std::sync::Arc;
 
 /// Modifier keys for menu item shortcuts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct Mod(u8);
+pub struct Modifiers(u8);
 
-impl Mod {
+/// Renamed to [`Modifiers`].
+#[deprecated(since = "0.2.0", note = "renamed to `Modifiers`")]
+pub type Mod = Modifiers;
+
+impl Modifiers {
     pub const NONE: Self = Self(0);
     /// Primary platform shortcut modifier (`Cmd` on macOS, `Ctrl` on Windows/Linux).
     pub const PRIMARY: Self = Self(1 << 0);
@@ -24,7 +28,7 @@ impl Mod {
     }
 }
 
-impl std::ops::BitOr for Mod {
+impl std::ops::BitOr for Modifiers {
     type Output = Self;
 
     fn bitor(self, rhs: Self) -> Self::Output {
@@ -35,24 +39,36 @@ impl std::ops::BitOr for Mod {
 /// Accelerator shortcut attached to a menu item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shortcut {
-    pub mods: Mod,
+    pub mods: Modifiers,
     pub key: String,
 }
 
 impl Shortcut {
-    pub fn new(mods: Mod, key: impl Into<String>) -> Self {
+    pub fn new(mods: Modifiers, key: impl Into<String>) -> Self {
         Self {
             mods,
             key: key.into(),
         }
     }
 
-    pub fn cmd(key: impl Into<String>) -> Self {
-        Self::new(Mod::PRIMARY, key)
+    /// The primary modifier: Cmd on macOS, Ctrl on Windows and Linux.
+    pub fn primary(key: impl Into<String>) -> Self {
+        Self::new(Modifiers::PRIMARY, key)
     }
 
+    /// Primary + Shift.
+    pub fn primary_shift(key: impl Into<String>) -> Self {
+        Self::new(Modifiers::PRIMARY | Modifiers::SHIFT, key)
+    }
+
+    #[deprecated(since = "0.2.0", note = "renamed to `Shortcut::primary` (Cmd or Ctrl)")]
+    pub fn cmd(key: impl Into<String>) -> Self {
+        Self::primary(key)
+    }
+
+    #[deprecated(since = "0.2.0", note = "renamed to `Shortcut::primary_shift`")]
     pub fn cmd_shift(key: impl Into<String>) -> Self {
-        Self::new(Mod::PRIMARY | Mod::SHIFT, key)
+        Self::primary_shift(key)
     }
 }
 
@@ -91,8 +107,8 @@ pub enum Role {
     /// Opens developer tools for the focused webview (Alt+Cmd+I); CEF only.
     ToggleDevTools,
     Minimize,
-    /// Zooms the window (maximize/restore); "Zoom" in the macOS Window menu.
-    Zoom,
+    /// Maximizes or restores the window; titled "Zoom" in the macOS Window menu.
+    Maximize,
     /// Brings all of the app's windows to the front (macOS).
     BringAllToFront,
     CloseWindow,
@@ -101,7 +117,11 @@ pub enum Role {
     Help,
 }
 
+#[allow(non_upper_case_globals)]
 impl Role {
+    #[deprecated(since = "0.2.0", note = "renamed to `Role::Maximize`")]
+    pub const Zoom: Self = Self::Maximize;
+
     /// Roles the runtime carries out on the focused webview, rather than the OS.
     pub(crate) fn is_webview_role(self) -> bool {
         matches!(
@@ -180,39 +200,39 @@ impl MenuItem {
     pub fn role(role: Role) -> Self {
         let (title, shortcut) = match role {
             Role::About => ("About", None),
-            Role::Settings => ("Settings…", Some(Shortcut::cmd(","))),
+            Role::Settings => ("Settings…", Some(Shortcut::primary(","))),
             Role::Services => ("Services", None),
-            Role::Hide => ("Hide", Some(Shortcut::cmd("h"))),
+            Role::Hide => ("Hide", Some(Shortcut::primary("h"))),
             Role::HideOthers => (
                 "Hide Others",
-                Some(Shortcut::new(Mod::PRIMARY | Mod::ALT, "h")),
+                Some(Shortcut::new(Modifiers::PRIMARY | Modifiers::ALT, "h")),
             ),
             Role::ShowAll => ("Show All", None),
-            Role::Quit => ("Quit", Some(Shortcut::cmd("q"))),
-            Role::Undo => ("Undo", Some(Shortcut::cmd("z"))),
-            Role::Redo => ("Redo", Some(Shortcut::cmd_shift("z"))),
-            Role::Cut => ("Cut", Some(Shortcut::cmd("x"))),
-            Role::Copy => ("Copy", Some(Shortcut::cmd("c"))),
-            Role::Paste => ("Paste", Some(Shortcut::cmd("v"))),
-            Role::SelectAll => ("Select All", Some(Shortcut::cmd("a"))),
-            Role::Reload => ("Reload", Some(Shortcut::cmd("r"))),
-            Role::Back => ("Back", Some(Shortcut::cmd("["))),
-            Role::Forward => ("Forward", Some(Shortcut::cmd("]"))),
-            Role::ActualSize => ("Actual Size", Some(Shortcut::cmd("0"))),
-            Role::ZoomIn => ("Zoom In", Some(Shortcut::cmd("="))),
-            Role::ZoomOut => ("Zoom Out", Some(Shortcut::cmd("-"))),
+            Role::Quit => ("Quit", Some(Shortcut::primary("q"))),
+            Role::Undo => ("Undo", Some(Shortcut::primary("z"))),
+            Role::Redo => ("Redo", Some(Shortcut::primary_shift("z"))),
+            Role::Cut => ("Cut", Some(Shortcut::primary("x"))),
+            Role::Copy => ("Copy", Some(Shortcut::primary("c"))),
+            Role::Paste => ("Paste", Some(Shortcut::primary("v"))),
+            Role::SelectAll => ("Select All", Some(Shortcut::primary("a"))),
+            Role::Reload => ("Reload", Some(Shortcut::primary("r"))),
+            Role::Back => ("Back", Some(Shortcut::primary("["))),
+            Role::Forward => ("Forward", Some(Shortcut::primary("]"))),
+            Role::ActualSize => ("Actual Size", Some(Shortcut::primary("0"))),
+            Role::ZoomIn => ("Zoom In", Some(Shortcut::primary("="))),
+            Role::ZoomOut => ("Zoom Out", Some(Shortcut::primary("-"))),
             Role::ToggleDevTools => (
                 "Developer Tools",
-                Some(Shortcut::new(Mod::PRIMARY | Mod::ALT, "i")),
+                Some(Shortcut::new(Modifiers::PRIMARY | Modifiers::ALT, "i")),
             ),
-            Role::Minimize => ("Minimize", Some(Shortcut::cmd("m"))),
-            Role::Zoom => ("Zoom", None),
+            Role::Minimize => ("Minimize", Some(Shortcut::primary("m"))),
+            Role::Maximize => ("Zoom", None),
             Role::BringAllToFront => ("Bring All to Front", None),
-            Role::Help => ("Help", Some(Shortcut::cmd_shift("/"))),
-            Role::CloseWindow => ("Close Window", Some(Shortcut::cmd("w"))),
+            Role::Help => ("Help", Some(Shortcut::primary_shift("/"))),
+            Role::CloseWindow => ("Close Window", Some(Shortcut::primary("w"))),
             Role::Fullscreen => (
                 "Toggle Full Screen",
-                Some(Shortcut::new(Mod::PRIMARY | Mod::CTRL, "f")),
+                Some(Shortcut::new(Modifiers::PRIMARY | Modifiers::CTRL, "f")),
             ),
         };
         Self::Action {
@@ -282,7 +302,7 @@ impl MenuItem {
 impl Shortcut {
     /// `Ctrl+<key>` on every platform (not Cmd on macOS).
     pub fn ctrl(key: impl Into<String>) -> Self {
-        Self::new(Mod::CTRL, key)
+        Self::new(Modifiers::CTRL, key)
     }
 }
 
@@ -376,7 +396,7 @@ impl Menu {
             .submenu(
                 Submenu::new("Window")
                     .item(MenuItem::role(Role::Minimize))
-                    .item(MenuItem::role(Role::Zoom))
+                    .item(MenuItem::role(Role::Maximize))
                     .separator()
                     .item(MenuItem::role(Role::CloseWindow))
                     .separator()
@@ -391,7 +411,15 @@ impl Menu {
             let at = app
                 .items
                 .iter()
-                .position(|i| matches!(i, MenuItem::Action { role: Some(Role::About), .. }))
+                .position(|i| {
+                    matches!(
+                        i,
+                        MenuItem::Action {
+                            role: Some(Role::About),
+                            ..
+                        }
+                    )
+                })
                 .map_or(0, |p| p + 1);
             app.items.insert(at, MenuItem::Separator);
             app.items.insert(at + 1, MenuItem::role(Role::Settings));
@@ -461,7 +489,9 @@ impl MenuItemHandle {
 
 impl std::fmt::Debug for MenuItemHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MenuItemHandle").field("id", &self.id).finish()
+        f.debug_struct("MenuItemHandle")
+            .field("id", &self.id)
+            .finish()
     }
 }
 
@@ -476,14 +506,14 @@ impl Shortcut {
             [mods @ .., key] if !key.is_empty() => (*key, mods),
             _ => return None,
         };
-        let mut m = Mod::NONE;
+        let mut m = Modifiers::NONE;
         for part in mods {
             m = m | match part.to_ascii_lowercase().as_str() {
-                "cmd" | "command" | "primary" | "cmdorctrl" => Mod::PRIMARY,
-                "shift" => Mod::SHIFT,
-                "alt" | "option" | "opt" => Mod::ALT,
-                "ctrl" | "control" => Mod::CTRL,
-                "meta" | "super" | "win" => Mod::META,
+                "cmd" | "command" | "primary" | "cmdorctrl" => Modifiers::PRIMARY,
+                "shift" => Modifiers::SHIFT,
+                "alt" | "option" | "opt" => Modifiers::ALT,
+                "ctrl" | "control" => Modifiers::CTRL,
+                "meta" | "super" | "win" => Modifiers::META,
                 _ => return None,
             };
         }
@@ -593,7 +623,9 @@ impl ContextMenuItem {
                     let id = match text("id") {
                         Some(id) => id,
                         None if !items.is_empty() => String::new(),
-                        None => return Err(format!("context menu item \"{label}\" needs an \"id\"")),
+                        None => {
+                            return Err(format!("context menu item \"{label}\" needs an \"id\""));
+                        }
                     };
                     let shortcut = match text("shortcut") {
                         Some(s) => Some(
@@ -633,10 +665,16 @@ mod tests {
 
     #[test]
     fn shortcut_parsing() {
-        assert_eq!(Shortcut::parse("F2"), Some(Shortcut::new(Mod::NONE, "F2")));
-        assert_eq!(Shortcut::parse("Cmd+Shift+K"), Some(Shortcut::cmd_shift("K")));
+        assert_eq!(
+            Shortcut::parse("F2"),
+            Some(Shortcut::new(Modifiers::NONE, "F2"))
+        );
+        assert_eq!(
+            Shortcut::parse("Cmd+Shift+K"),
+            Some(Shortcut::primary_shift("K"))
+        );
         assert_eq!(Shortcut::parse("ctrl + `"), Some(Shortcut::ctrl("`")));
-        assert_eq!(Shortcut::parse("Cmd++"), Some(Shortcut::cmd("+")));
+        assert_eq!(Shortcut::parse("Cmd++"), Some(Shortcut::primary("+")));
         assert_eq!(Shortcut::parse("Hyper+K"), None);
         assert_eq!(Shortcut::parse(""), None);
         assert_eq!(Shortcut::parse("Cmd+"), None);
@@ -654,16 +692,28 @@ mod tests {
         assert_eq!(items.len(), 4);
         assert_eq!(
             items[0],
-            ContextMenuItem::new("rename", "Rename").shortcut(Shortcut::new(Mod::NONE, "F2"))
+            ContextMenuItem::new("rename", "Rename").shortcut(Shortcut::new(Modifiers::NONE, "F2"))
         );
         assert_eq!(items[1], ContextMenuItem::Separator);
-        let ContextMenuItem::Item { items: sub, .. } = &items[2] else { panic!() };
+        let ContextMenuItem::Item { items: sub, .. } = &items[2] else {
+            panic!()
+        };
         assert_eq!(sub[0], ContextMenuItem::new("a", "A").checked(true));
-        assert_eq!(items[3], ContextMenuItem::new("delete", "Delete").danger().enabled(false));
+        assert_eq!(
+            items[3],
+            ContextMenuItem::new("delete", "Delete")
+                .danger()
+                .enabled(false)
+        );
 
         assert!(ContextMenuItem::from_page(&crate::json!({})).is_err());
         assert!(ContextMenuItem::from_page(&crate::json!([{ "label": "No id" }])).is_err());
-        assert!(ContextMenuItem::from_page(&crate::json!([{ "id": "x", "label": "X", "shortcut": "Hyper+K" }])).is_err());
+        assert!(
+            ContextMenuItem::from_page(
+                &crate::json!([{ "id": "x", "label": "X", "shortcut": "Hyper+K" }])
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -687,16 +737,16 @@ mod tests {
 
     #[test]
     fn settings_emit_checked_and_insert() {
-        let m = Menu::standard()
-            .with_settings()
-            .insert_submenu(Submenu::new("Go").item(MenuItem::new("panel", "Panel").emit().checked(true)));
+        let m = Menu::standard().with_settings().insert_submenu(
+            Submenu::new("Go").item(MenuItem::new("panel", "Panel").emit().checked(true)),
+        );
         let app = roles(&m.submenus[0]);
         assert_eq!(&app[..2], &[Some(Role::About), Some(Role::Settings)]);
         let MenuItem::Action { id, shortcut, .. } = &m.submenus[0].items[2] else {
             panic!("expected Settings after a separator");
         };
         assert_eq!(id, "settings");
-        assert_eq!(shortcut, &Some(Shortcut::cmd(",")));
+        assert_eq!(shortcut, &Some(Shortcut::primary(",")));
 
         let titles: Vec<&str> = m.submenus.iter().map(|s| s.title.as_str()).collect();
         assert_eq!(titles, ["App", "Edit", "View", "Go", "Window", "Help"]);

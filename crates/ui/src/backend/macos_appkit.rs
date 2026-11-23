@@ -6,7 +6,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -18,9 +17,9 @@ use crate::dialog::{
     FileDialogKind, FileDialogSpec, MessageButtons, MessageDialogSpec, MessageLevel, MessageResult,
 };
 use crate::event::{Event, WindowEvent};
-use crate::menu::{ContextMenuItem, Menu, MenuItem, MenuItemUpdate, Mod, Role, Shortcut};
+use crate::menu::{ContextMenuItem, Menu, MenuItem, MenuItemUpdate, Modifiers, Role, Shortcut};
 use crate::window::{
-    Backdrop, Bounds, Display, Tabbing, Theme, TitleBar, WindowId, WindowSpec, WindowState,
+    Backdrop, Bounds, Monitor, Tabbing, Theme, TitleBar, WindowId, WindowSpec, WindowState,
 };
 use crate::{Error, Result};
 
@@ -154,7 +153,11 @@ extern "C" fn app_will_terminate(_: Id, _: Sel, _: Id) {
 
 /// `application:openURLs:` receives custom-scheme URLs and opened files alike.
 extern "C" fn app_open_urls(_: Id, _: Sel, _: Id, urls: Id) {
-    let count = if urls.is_null() { 0 } else { msg!(usize; urls, "count") };
+    let count = if urls.is_null() {
+        0
+    } else {
+        msg!(usize; urls, "count")
+    };
     let mut files = Vec::new();
     let mut links = Vec::new();
     for i in 0..count {
@@ -178,7 +181,7 @@ extern "C" fn app_open_urls(_: Id, _: Sel, _: Id, urls: Id) {
 
 extern "C" fn app_should_reopen(_: Id, _: Sel, _: Id, _has_visible: bool) -> bool {
     if let Ok(mut q) = APP_EVENT_QUEUE.lock() {
-        q.push(Event::Reopen);
+        q.push(Event::Activate);
     }
     true
 }
@@ -215,16 +218,21 @@ extern "C" fn window_did_resize(_: Id, _: Sel, notification: Id) {
     let entry = NS_TO_WINDOW_ID.with(|m| {
         m.borrow().get(&(ns_win as usize)).copied().and_then(|id| {
             WINDOW_RECORDS.with(|r| {
-                r.borrow()
-                    .get(&id)
-                    .map(|rec| (id, rec.title_bar, rec.content_view, rec.native_controls_layout))
+                r.borrow().get(&id).map(|rec| {
+                    (
+                        id,
+                        rec.title_bar,
+                        rec.content_view,
+                        rec.native_controls_layout,
+                    )
+                })
             })
         })
     });
     if let Some((id, title_bar, content_view, native_layout)) = entry {
-        if let TitleBar::Inset {
+        if let TitleBar::Overlay {
             height,
-            traffic_lights,
+            window_controls: traffic_lights,
         } = title_bar
             && !(native_layout && traffic_lights.is_none())
         {
@@ -246,21 +254,18 @@ extern "C" fn window_did_resize(_: Id, _: Sel, notification: Id) {
 extern "C" fn window_did_end_live_resize(_: Id, _: Sel, notification: Id) {
     let ns_win = msg!(Id; notification, "object");
     let title_bar = NS_TO_WINDOW_ID.with(|m| {
-        m.borrow()
-            .get(&(ns_win as usize))
-            .copied()
-            .and_then(|id| {
-                WINDOW_RECORDS.with(|r| {
-                    r.borrow()
-                        .get(&id)
-                        .map(|rec| (rec.title_bar, rec.native_controls_layout))
-                })
+        m.borrow().get(&(ns_win as usize)).copied().and_then(|id| {
+            WINDOW_RECORDS.with(|r| {
+                r.borrow()
+                    .get(&id)
+                    .map(|rec| (rec.title_bar, rec.native_controls_layout))
             })
+        })
     });
     if let Some((
-        TitleBar::Inset {
+        TitleBar::Overlay {
             height,
-            traffic_lights,
+            window_controls: traffic_lights,
         },
         native_layout,
     )) = title_bar
@@ -674,6 +679,14 @@ pub(crate) fn init_ns_app(with_cef_protocol: bool) -> Result<Id> {
     // Regular activation policy so bare `cargo run` gets Dock icon, menu bar, and focus.
     msg!(bool; app, "setActivationPolicy:", 0isize => isize);
     set_app_menu(&Menu::standard());
+    super::macos_notify::install_delegate();
+    // `ui-pack run` points unbundled binaries at the manifest's icon.
+    if !super::macos_notify::is_bundled()
+        && let Some(path) = std::env::var_os("UI_DOCK_ICON")
+        && let Ok(bytes) = std::fs::read(path)
+    {
+        dock_set_icon(&bytes);
+    }
     msg!((); app, "finishLaunching");
     msg!((); app, "activateIgnoringOtherApps:", true => bool);
     Ok(app)
@@ -725,7 +738,7 @@ pub(crate) fn open_ns_window(id: WindowId, spec: &WindowSpec) -> Result<Id> {
             }
             m
         }
-        TitleBar::Inset { .. } => {
+        TitleBar::Overlay { .. } => {
             let mut m =
                 MASK_TITLED | MASK_CLOSABLE | MASK_MINIATURIZABLE | MASK_FULL_SIZE_CONTENT_VIEW;
             if spec.resizable {
@@ -733,7 +746,7 @@ pub(crate) fn open_ns_window(id: WindowId, spec: &WindowSpec) -> Result<Id> {
             }
             m
         }
-        TitleBar::Hidden => {
+        TitleBar::Frameless => {
             if spec.resizable {
                 MASK_BORDERLESS | MASK_RESIZABLE
             } else {
@@ -785,11 +798,11 @@ pub(crate) fn open_ns_window(id: WindowId, spec: &WindowSpec) -> Result<Id> {
     msg!((); ns_win, "setTabbingMode:", tab_mode => isize);
 
     match spec.title_bar {
-        TitleBar::Inset { .. } => {
+        TitleBar::Overlay { .. } => {
             msg!((); ns_win, "setTitlebarAppearsTransparent:", true => bool);
             msg!((); ns_win, "setTitleVisibility:", 1isize => isize); // NSWindowTitleHidden
         }
-        TitleBar::Hidden => {
+        TitleBar::Frameless => {
             msg!((); ns_win, "setHasShadow:", true => bool);
         }
         TitleBar::Native => {}
@@ -804,9 +817,9 @@ pub(crate) fn open_ns_window(id: WindowId, spec: &WindowSpec) -> Result<Id> {
 
     if spec.backdrop != Backdrop::None {
         let material: isize = match spec.backdrop {
-            Backdrop::Sidebar => 7,                   // NSVisualEffectMaterialSidebar
-            Backdrop::Transient => 6,                 // NSVisualEffectMaterialPopover
-            Backdrop::Mica | Backdrop::Acrylic => 21, // NSVisualEffectMaterialUnderWindowBackground
+            Backdrop::Sidebar => 7, // NSVisualEffectMaterialSidebar
+            Backdrop::Popover => 6, // NSVisualEffectMaterialPopover
+            Backdrop::Window => 21, // NSVisualEffectMaterialUnderWindowBackground
             Backdrop::None => 0,
         };
         let bounds = rect_of(content_view, "bounds");
@@ -870,9 +883,9 @@ pub(crate) fn open_ns_window(id: WindowId, spec: &WindowSpec) -> Result<Id> {
         msg!((); ns_app(), "activateIgnoringOtherApps:", true => bool);
     }
 
-    if let TitleBar::Inset {
+    if let TitleBar::Overlay {
         height,
-        traffic_lights,
+        window_controls: traffic_lights,
     } = spec.title_bar
         && !(spec.macos.toolbar_style.is_some() && traffic_lights.is_none())
     {
@@ -891,7 +904,11 @@ pub(crate) fn open_ns_window(id: WindowId, spec: &WindowSpec) -> Result<Id> {
     Ok(ns_win)
 }
 
-fn position_traffic_lights(ns_win: Id, height: u32, traffic_lights: Option<(u32, u32)>) {
+fn position_traffic_lights(
+    ns_win: Id,
+    height: u32,
+    traffic_lights: Option<crate::window::WindowControls>,
+) {
     let close_btn = msg!(Id; ns_win, "standardWindowButton:", 0usize => usize);
     let mini_btn = msg!(Id; ns_win, "standardWindowButton:", 1usize => usize);
     let zoom_btn = msg!(Id; ns_win, "standardWindowButton:", 2usize => usize);
@@ -936,7 +953,7 @@ fn position_traffic_lights(ns_win: Id, height: u32, traffic_lights: Option<(u32,
         .max(container_h);
 
     let (start_x, top_y) = match traffic_lights {
-        Some((x, y)) => (f64::from(x), f64::from(y)),
+        Some(c) => (f64::from(c.x), f64::from(c.y)),
         None => (14.0, ((container_h - btn_h) / 2.0).round()),
     };
     let target_y = if flipped { top_y } else { tv_h - top_y - btn_h };
@@ -1089,9 +1106,11 @@ pub(crate) fn titlebar_double_click(id: WindowId) {
     let action = if defaults.is_null() {
         TitlebarAction::Zoom
     } else {
-        let value = msg!(Id; defaults, "stringForKey:", ns_string("AppleActionOnDoubleClick") => Id);
+        let value =
+            msg!(Id; defaults, "stringForKey:", ns_string("AppleActionOnDoubleClick") => Id);
         let setting = (!value.is_null()).then(|| rust_string(value));
-        let legacy = msg!(bool; defaults, "boolForKey:", ns_string("AppleMiniaturizeOnDoubleClick") => Id);
+        let legacy =
+            msg!(bool; defaults, "boolForKey:", ns_string("AppleMiniaturizeOnDoubleClick") => Id);
         titlebar_action_for(setting.as_deref(), legacy)
     };
     match action {
@@ -1146,15 +1165,21 @@ pub(crate) struct WindowChrome {
 }
 
 pub(crate) fn window_chrome(id: WindowId) -> Option<WindowChrome> {
-    let (ns_win, title_bar) =
-        WINDOW_RECORDS.with(|r| r.borrow().get(&id).map(|rec| (rec.ns_window, rec.title_bar)))?;
+    let (ns_win, title_bar) = WINDOW_RECORDS.with(|r| {
+        r.borrow()
+            .get(&id)
+            .map(|rec| (rec.ns_window, rec.title_bar))
+    })?;
     let mask = msg!(usize; ns_win, "styleMask");
     let fullscreen = (mask & (1 << 14)) != 0; // NSWindowStyleMaskFullScreen
     let focused = msg!(bool; ns_win, "isKeyWindow");
-    let native_layout =
-        WINDOW_RECORDS.with(|r| r.borrow().get(&id).is_some_and(|rec| rec.native_controls_layout));
+    let native_layout = WINDOW_RECORDS.with(|r| {
+        r.borrow()
+            .get(&id)
+            .is_some_and(|rec| rec.native_controls_layout)
+    });
     let (titlebar_height, controls_left) = match title_bar {
-        TitleBar::Inset { height, .. } => {
+        TitleBar::Overlay { height, .. } => {
             let left = if fullscreen {
                 0.0
             } else {
@@ -1171,7 +1196,7 @@ pub(crate) fn window_chrome(id: WindowId) -> Option<WindowChrome> {
             };
             (h, left)
         }
-        TitleBar::Native | TitleBar::Hidden => (0.0, 0.0),
+        TitleBar::Native | TitleBar::Frameless => (0.0, 0.0),
     };
     Some(WindowChrome {
         titlebar_height,
@@ -1244,7 +1269,7 @@ pub(crate) fn app_theme() -> Theme {
     }
 }
 
-pub(crate) fn displays() -> Vec<Display> {
+pub(crate) fn displays() -> Vec<Monitor> {
     let screens = msg!(Id; class("NSScreen"), "screens");
     if screens.is_null() {
         return Vec::new();
@@ -1261,7 +1286,7 @@ pub(crate) fn displays() -> Vec<Display> {
         } else {
             format!("Display {}", i + 1)
         };
-        out.push(Display {
+        out.push(Monitor {
             name,
             bounds: Bounds {
                 x: frame.origin.x.round() as i32,
@@ -1293,14 +1318,13 @@ pub(crate) fn open_external(url: &str) -> Result<()> {
 }
 
 pub(crate) fn notify(title: &str, body: &str) {
-    // Use osascript on macOS to avoid UNUserNotificationCenter exceptions on unbundled `cargo run` binaries.
-    let esc_title = title.replace('\\', "\\\\").replace('"', "\\\"");
-    let esc_body = body.replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!("display notification \"{esc_body}\" with title \"{esc_title}\"");
-    let _ = Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(script)
-        .spawn();
+    super::macos_notify::show(None, title, None, body, true);
+}
+
+pub(crate) fn push_app_event(ev: Event) {
+    if let Ok(mut q) = APP_EVENT_QUEUE.lock() {
+        q.push(ev);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1328,6 +1352,19 @@ pub(crate) fn app_name() -> String {
     }
     let info = msg!(Id; class("NSProcessInfo"), "processInfo");
     rust_string(msg!(Id; info, "processName"))
+}
+
+/// A number saved in the app's user defaults, if present.
+pub(crate) fn defaults_f64(key: &str) -> Option<f64> {
+    let d = msg!(Id; class("NSUserDefaults"), "standardUserDefaults");
+    let v = msg!(Id; d, "objectForKey:", ns_string(key) => Id);
+    (!v.is_null() && msg!(bool; v, "isKindOfClass:", class("NSNumber") => Id))
+        .then(|| msg!(f64; v, "doubleValue"))
+}
+
+pub(crate) fn set_defaults_f64(key: &str, value: f64) {
+    let d = msg!(Id; class("NSUserDefaults"), "standardUserDefaults");
+    msg!((); d, "setDouble:forKey:", value => f64, ns_string(key) => Id);
 }
 
 /// `CFBundleShortVersionString` when running from a bundle.
@@ -1396,7 +1433,7 @@ fn native_role_selector(role: Role) -> Option<&'static str> {
         Role::Paste => "paste:",
         Role::SelectAll => "selectAll:",
         Role::Minimize => "performMiniaturize:",
-        Role::Zoom => "performZoom:",
+        Role::Maximize => "performZoom:",
         Role::BringAllToFront => "arrangeInFront:",
         Role::CloseWindow => "performClose:",
         Role::Fullscreen => "toggleFullScreen:",
@@ -1548,16 +1585,16 @@ pub(crate) fn set_app_menu(menu: &Menu) {
 
 fn modifier_mask(sc: &Shortcut) -> usize {
     let mut mask = 0usize;
-    if sc.mods.contains(Mod::PRIMARY) || sc.mods.contains(Mod::META) {
+    if sc.mods.contains(Modifiers::PRIMARY) || sc.mods.contains(Modifiers::META) {
         mask |= MOD_COMMAND;
     }
-    if sc.mods.contains(Mod::SHIFT) {
+    if sc.mods.contains(Modifiers::SHIFT) {
         mask |= MOD_SHIFT;
     }
-    if sc.mods.contains(Mod::ALT) {
+    if sc.mods.contains(Modifiers::ALT) {
         mask |= MOD_OPTION;
     }
-    if sc.mods.contains(Mod::CTRL) {
+    if sc.mods.contains(Modifiers::CTRL) {
         mask |= MOD_CONTROL;
     }
     mask
@@ -1748,7 +1785,9 @@ pub(crate) fn dock_badge() -> Option<String> {
         return None;
     }
     let v = msg!(Id; tile, "badgeLabel");
-    (!v.is_null()).then(|| rust_string(v)).filter(|s| !s.is_empty())
+    (!v.is_null())
+        .then(|| rust_string(v))
+        .filter(|s| !s.is_empty())
 }
 
 /// `requestUserAttention:`; returns the request id (0 when the app is already active).
@@ -1789,7 +1828,8 @@ pub(crate) fn set_dock_menu(items: &[MenuItem]) {
         }
         *s
     });
-    let menu = msg!(Id; msg!(Id; class("NSMenu"), "alloc"), "initWithTitle:", ns_string("Dock") => Id);
+    let menu =
+        msg!(Id; msg!(Id; class("NSMenu"), "alloc"), "initWithTitle:", ns_string("Dock") => Id);
     for item in items {
         match item {
             MenuItem::Separator => {
@@ -2085,7 +2125,10 @@ mod tests {
         let delete = item(menu, 3);
         assert!(!msg!(bool; delete, "isEnabled"));
         assert!(!msg!(Id; delete, "attributedTitle").is_null());
-        assert_eq!(msg!(usize; delete, "keyEquivalentModifierMask"), MOD_COMMAND);
+        assert_eq!(
+            msg!(usize; delete, "keyEquivalentModifierMask"),
+            MOD_COMMAND
+        );
         assert_eq!(tags.len(), 3, "one tag per leaf item");
 
         // Choosing "Rename": AppKit sends the item's action to its target.

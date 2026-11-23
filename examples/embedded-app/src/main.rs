@@ -12,12 +12,15 @@
 use std::io::Write;
 
 use ui::event::Event;
-use ui::{Window, WebView};
+use ui::{WebView, Window};
 
 fn log_event(line: &str) {
     println!("{line}");
     if let Some(path) = std::env::var_os("UI_EVENT_LOG")
-        && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+        && let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
     {
         let _ = writeln!(f, "{line}");
     }
@@ -36,9 +39,14 @@ fn main() -> ui::Result<()> {
         });
         let win = Window::new("Embedded App").size(900, 600).open(app)?;
         WebView::new()
-            .bundle("app", ui::embedded!().spa("index.html").immutable("assets/"))
+            .bundle(
+                "app",
+                ui::embedded!().spa("index.html").immutable("assets/"),
+            )
             .invoke("echo", |_ctx, s: String| format!("echo:{s}"))
-            .on("report", |_ctx, report: ui::Value| println!("page report: {}", report.to_json()))
+            .on("report", |_ctx, report: ui::Value| {
+                println!("page report: {}", report.to_json())
+            })
             .mount(&win)?;
         Ok(())
     })

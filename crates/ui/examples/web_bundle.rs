@@ -1,7 +1,7 @@
 //! Example matching README Quickstart: single-page `app://localhost/` web bundle,
 //! inset titlebar + traffic lights, sidebar backdrop, drag region, and typed IPC.
 
-use ui::{Backdrop, Request, Response, TitleBar, WebView, Window, json};
+use ui::{Backdrop, Request, Response, TitleBar, WebView, Window, WindowControls, json};
 
 mod assets {
     use super::*;
@@ -130,14 +130,14 @@ fn main() -> ui::Result<()> {
         let win = Window::new("My App")
             .size(1280, 840)
             .min_size(760, 520)
-            .title_bar(TitleBar::inset(38).traffic_lights(14, 12))
+            .title_bar(TitleBar::overlay(38).window_controls(WindowControls::at(14, 12)))
             .backdrop(Backdrop::Sidebar)
             .open(app)?;
 
         WebView::new()
             .assets("app", assets::serve)
-            .inspectable(cfg!(debug_assertions))
-            .rpc("open_project", |ctx, ()| {
+            .devtools(cfg!(debug_assertions))
+            .invoke("open_project", |ctx, ()| {
                 ctx.window().dialog().pick_folder()
             })
             .on("ready", move |ctx, ()| {

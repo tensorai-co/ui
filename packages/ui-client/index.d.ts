@@ -120,6 +120,15 @@ export interface MessageOptions {
   buttons?: "ok" | "okCancel" | "yesNo" | "yesNoCancel";
 }
 
+export interface NotifyOptions {
+  /** Showing another notification with the same id replaces it. */
+  id?: string;
+  subtitle?: string;
+  /** Default true. */
+  sound?: boolean;
+  onClick?: (id: string) => void;
+}
+
 export type WindowState = "normal" | "minimized" | "maximized" | "fullscreen";
 
 /** The standard page calls; the app enables them with `WebViewBuilder::standard_rpcs`. */
@@ -157,11 +166,25 @@ export const ui: {
     setDocumentEdited(edited: boolean): Promise<void>;
     setTheme(theme: Theme): Promise<void>;
   };
+  readonly webview: {
+    /** Selects the next match; null when the engine can't tell (CEF). */
+    find(text: string, options?: { caseSensitive?: boolean; backwards?: boolean; wraps?: boolean }): Promise<boolean | null>;
+    clearFind(): Promise<void>;
+    print(): Promise<void>;
+    /** The page rendered as PDF (WebKit). */
+    pdf(): Promise<Uint8Array>;
+    /** Files dropped on the page, with real filesystem paths (WebKit). */
+    onFileDrop(fn: (drop: { paths: string[]; x: number; y: number }) => void): Unsubscribe;
+  };
   readonly menu: {
     on(id: string, fn: () => void): Unsubscribe;
     set(update: MenuItemUpdate): Promise<boolean>;
   };
   /** Native context menu; resolves to the chosen id, or null when dismissed (always null on the web). */
   contextMenu(items: ContextMenuItem[], position?: { x: number; y: number }): Promise<string | null>;
-  notify(title: string, body?: string): Promise<void>;
+  /** Shows a notification; resolves to its id. `onClick` needs a bundled app. */
+  notify(title: string, body?: string, options?: NotifyOptions): Promise<string>;
+  readonly notification: {
+    remove(id: string): Promise<void>;
+  };
 };

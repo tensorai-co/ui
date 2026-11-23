@@ -37,7 +37,7 @@ test("inside a ui webview: wrappers call the standard RPC names", async () => {
   assert.equal(calls.at(-1)[1].buttons, "yes_no_cancel");
   assert.equal(await m.ui.dialog.confirm("Delete?"), true);
   await m.ui.notify("Done");
-  assert.deepEqual(calls.at(-1), ["ui:notify", "Done", null]);
+  assert.deepEqual(calls.at(-1), ["ui:notify", "Done", null, { id: undefined, subtitle: undefined, sound: undefined }]);
   await m.ui.window.setFullscreen(1);
   assert.deepEqual(calls.at(-1), ["ui:window.setFullscreen", true]);
   await m.ui.window.setTheme("dark");
@@ -75,5 +75,26 @@ test("ui.app.on replays URLs and files that arrived before the page", async () =
   assert.deepEqual(files, ["/tmp/x.md"]);
   assert.equal(takes, 1, "pending items are fetched once per page");
   assert.throws(() => m.ui.app.on("nope", () => {}), /unknown ui.app event/);
+  delete globalThis.window;
+});
+
+test("ui.notify onClick fires for its own id only", async () => {
+  const listeners = new Set();
+  globalThis.window = {
+    ipc: {
+      invoke: (method, ...args) => Promise.resolve(method === "ui:notify" ? "n-7" : null),
+      on: (ch, fn) => { listeners.add(fn); return () => listeners.delete(fn); },
+      menu: { on: () => () => {}, set: () => Promise.resolve(false) },
+      window: { setTheme: () => Promise.resolve() },
+    },
+  };
+  const m = await import("../index.js?notify");
+  const clicks = [];
+  const id = await m.ui.notify("Build finished", "All green", { onClick: (i) => clicks.push(i) });
+  assert.equal(id, "n-7");
+  for (const fn of listeners) { fn("other"); fn("n-7"); }
+  assert.deepEqual(clicks, ["n-7"]);
+  await m.ui.notification.remove("n-7");
+  assert.equal(listeners.size, 0, "remove drops the click listener");
   delete globalThis.window;
 });

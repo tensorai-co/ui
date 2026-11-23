@@ -1,6 +1,7 @@
 //! Example matching README Quickstart: URL-based desktop app + typed `ipc_enum!` commands.
 
-use ui::{Nav, Profile, Tabbing, TitleBar, WebView, Window};
+use ui::macos::{Tabbing, WindowBuilderExt};
+use ui::{NavDecision, Profile, TitleBar, WebView, Window};
 
 ui::ipc_enum! {
     enum AppCmd {
@@ -18,7 +19,7 @@ fn main() -> ui::Result<()> {
         let win = Window::new("Example App")
             .size(1200, 800)
             .title_bar(TitleBar::Native)
-            .tabbing(Tabbing::Disallowed)
+            .macos(|m| m.tabbing(Tabbing::Disallowed))
             .open(app)?;
 
         let allowed_host = target_url
@@ -30,12 +31,12 @@ fn main() -> ui::Result<()> {
         WebView::url(target_url)
             .profile(Profile::persistent("default"))
             .on_navigate(move |req| match req.host() {
-                Some(h) if h == allowed_host => Nav::Allow,
-                Some(_) => Nav::External,
-                None => Nav::Allow,
+                Some(h) if h == allowed_host => NavDecision::Allow,
+                Some(_) => NavDecision::OpenInBrowser,
+                None => NavDecision::Allow,
             })
-            .on_popup(|_req| Nav::External)
-            .on_msg::<AppCmd>(|ctx, cmd| match cmd {
+            .on_new_window(|_req| NavDecision::OpenInBrowser)
+            .on_command::<AppCmd>(|ctx, cmd| match cmd {
                 AppCmd::SetTitle { title } => ctx.window().set_title(&title),
                 AppCmd::Notify { title, body } => ctx.app().notify(&title, &body),
             })

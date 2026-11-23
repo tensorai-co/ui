@@ -8,6 +8,7 @@ use crate::app::App;
 use crate::backend::Runtime;
 use crate::backend::macos_appkit as appkit;
 use crate::menu::MenuItem;
+pub use crate::window::Tabbing;
 use crate::window::{Window, WindowBuilder, WindowId};
 use crate::{Error, Result};
 
@@ -80,10 +81,15 @@ impl Dock {
     /// unbundled `cargo run` binary shows the app's icon.
     pub fn set_icon(&self, image: &[u8]) -> Result<()> {
         let bytes = image.to_vec();
-        if self.runtime.call_main_sync(move || appkit::dock_set_icon(&bytes)) {
+        if self
+            .runtime
+            .call_main_sync(move || appkit::dock_set_icon(&bytes))
+        {
             Ok(())
         } else {
-            Err(Error::Platform("could not decode the Dock icon image".into()))
+            Err(Error::Platform(
+                "could not decode the Dock icon image".into(),
+            ))
         }
     }
 
@@ -111,7 +117,9 @@ impl Dock {
     /// Bounces the Dock icon. Does nothing (returns `None`) while the app is active.
     pub fn bounce(&self, attention: Attention) -> Option<AttentionRequest> {
         let critical = attention == Attention::Critical;
-        let id = self.runtime.call_main_sync(move || appkit::dock_bounce(critical));
+        let id = self
+            .runtime
+            .call_main_sync(move || appkit::dock_bounce(critical));
         (id != 0).then_some(AttentionRequest(id))
     }
 
@@ -125,7 +133,8 @@ impl Dock {
     /// reach the focused page as `menu:<id>` and the app as `Event::Menu(id)`).
     /// An empty list removes it.
     pub fn set_menu(&self, items: Vec<MenuItem>) {
-        self.runtime.call_main_sync(move || appkit::set_dock_menu(&items));
+        self.runtime
+            .call_main_sync(move || appkit::set_dock_menu(&items));
     }
 }
 
@@ -166,6 +175,7 @@ pub struct MacWindowOptions {
     pub(crate) level: WindowLevel,
     pub(crate) all_spaces: bool,
     pub(crate) fullscreen_auxiliary: bool,
+    pub(crate) tabbing: Option<Tabbing>,
 }
 
 impl Default for MacWindowOptions {
@@ -177,6 +187,7 @@ impl Default for MacWindowOptions {
             level: WindowLevel::Normal,
             all_spaces: false,
             fullscreen_auxiliary: false,
+            tabbing: None,
         }
     }
 }
@@ -210,6 +221,12 @@ impl MacWindowOptions {
         self
     }
 
+    /// Native window tabs (`NSWindowTabbingMode`).
+    pub fn tabbing(mut self, tabbing: Tabbing) -> Self {
+        self.tabbing = Some(tabbing);
+        self
+    }
+
     /// Lets the window appear over another app's full-screen window.
     pub fn fullscreen_auxiliary(mut self, on: bool) -> Self {
         self.fullscreen_auxiliary = on;
@@ -232,7 +249,11 @@ pub trait WindowBuilderExt {
 
 impl WindowBuilderExt for WindowBuilder {
     fn macos(self, f: impl FnOnce(MacWindowOptions) -> MacWindowOptions) -> Self {
-        self.map_macos(f)
+        let mut b = self.map_macos(f);
+        if let Some(t) = b.macos_tabbing() {
+            b.set_tabbing(t);
+        }
+        b
     }
 }
 
@@ -268,7 +289,8 @@ impl MacWindow {
 
     pub fn document_edited(&self) -> bool {
         let id = self.id;
-        self.runtime.call_main_sync(move || appkit::document_edited(id))
+        self.runtime
+            .call_main_sync(move || appkit::document_edited(id))
     }
 
     pub fn set_window_controls_visible(&self, visible: bool) {
@@ -279,12 +301,14 @@ impl MacWindow {
 
     pub fn set_level(&self, level: WindowLevel) {
         let id = self.id;
-        self.runtime.call_main_sync(move || appkit::set_window_level(id, level));
+        self.runtime
+            .call_main_sync(move || appkit::set_window_level(id, level));
     }
 
     pub fn level(&self) -> WindowLevel {
         let id = self.id;
-        self.runtime.call_main_sync(move || appkit::window_level(id))
+        self.runtime
+            .call_main_sync(move || appkit::window_level(id))
     }
 
     pub fn set_titlebar_separator(&self, on: bool) {

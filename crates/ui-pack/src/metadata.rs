@@ -28,6 +28,8 @@ pub struct AppMetadata {
     pub document_types: Vec<String>,
     /// Entitlements plist (relative to the manifest) used when signing.
     pub entitlements: Option<String>,
+    /// Inline `[package.metadata.ui.entitlements]` keys, used when no file is named.
+    pub entitlement_keys: Vec<(String, bool)>,
     /// Command that starts the web dev server for `ui-pack run --dev`.
     pub dev_command: Option<String>,
     /// The dev server's URL for `ui-pack run --dev` (default `http://localhost:5173`).
@@ -74,6 +76,7 @@ impl AppMetadata {
         let mut url_schemes = Vec::new();
         let mut document_types = Vec::new();
         let mut entitlements = None;
+        let mut entitlement_keys = Vec::new();
         let mut dev_command = None;
         let mut dev_url = None;
 
@@ -117,6 +120,9 @@ impl AppMetadata {
                         }
                         _ => {}
                     },
+                    "package.metadata.ui.entitlements" => {
+                        entitlement_keys.push((key.trim_matches('"').to_owned(), val == "true"));
+                    }
                     _ => {}
                 }
             }
@@ -149,6 +155,7 @@ impl AppMetadata {
             url_schemes,
             document_types,
             entitlements,
+            entitlement_keys,
             dev_command,
             dev_url,
             manifest_dir: PathBuf::from("."),

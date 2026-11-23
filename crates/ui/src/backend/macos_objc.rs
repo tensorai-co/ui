@@ -3,8 +3,8 @@
 #![allow(dead_code)]
 
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub(crate) type Id = *mut c_void;
@@ -38,6 +38,9 @@ unsafe extern "C" {
     pub(crate) fn objc_getClass(name: *const c_char) -> Id;
     pub(crate) fn sel_registerName(name: *const c_char) -> Sel;
     pub(crate) fn objc_msgSend();
+    pub(crate) fn objc_msgSendSuper();
+    pub(crate) fn object_getClass(obj: Id) -> Id;
+    pub(crate) fn class_getSuperclass(cls: Id) -> Id;
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn objc_msgSend_stret();
     pub(crate) fn objc_autoreleasePoolPush() -> *mut c_void;
@@ -58,6 +61,9 @@ unsafe extern "C" {
 unsafe extern "C" {}
 
 #[link(name = "WebKit", kind = "framework")]
+unsafe extern "C" {}
+
+#[link(name = "UserNotifications", kind = "framework")]
 unsafe extern "C" {}
 
 #[link(name = "Foundation", kind = "framework")]
@@ -374,6 +380,99 @@ static COMPLETION_DESCRIPTOR: RustCompletionDescriptor = RustCompletionDescripto
     copy_helper: completion_copy,
     dispose_helper: completion_dispose,
 };
+
+/// Invokes a Cocoa-supplied `void (^)(void)` completion block.
+pub(crate) fn call_block_void(block_ptr: Id) {
+    if block_ptr.is_null() {
+        return;
+    }
+    // SAFETY: Caller supplies a valid Objective-C block taking no arguments.
+    unsafe {
+        let blk = &*(block_ptr as *const ObjCBlockHeader);
+        let f: unsafe extern "C" fn(*const ObjCBlockHeader) = std::mem::transmute(blk.invoke);
+        f(blk);
+    }
+}
+
+type CallbackFn = Mutex<Option<Box<dyn FnOnce(isize) + Send>>>;
+
+#[repr(C)]
+struct RustCallbackDescriptor {
+    reserved: usize,
+    size: usize,
+    copy_helper: unsafe extern "C" fn(*mut RustCallbackBlock, *const RustCallbackBlock),
+    dispose_helper: unsafe extern "C" fn(*mut RustCallbackBlock),
+}
+
+/// A block whose first argument (`BOOL` or `NSInteger`) is handed to a Rust
+/// closure, at most once, on whatever thread Cocoa calls it from.
+#[repr(C)]
+pub(crate) struct RustCallbackBlock {
+    isa: *const c_void,
+    flags: i32,
+    reserved: i32,
+    invoke: unsafe extern "C" fn(*mut RustCallbackBlock, isize),
+    descriptor: *const RustCallbackDescriptor,
+    ctx: *const CallbackFn,
+}
+
+unsafe extern "C" fn callback_copy(dst: *mut RustCallbackBlock, src: *const RustCallbackBlock) {
+    // SAFETY: Both blocks hold an `Arc<CallbackFn>` raw pointer.
+    unsafe {
+        let ptr = (*src).ctx;
+        Arc::increment_strong_count(ptr);
+        (*dst).ctx = ptr;
+    }
+}
+
+unsafe extern "C" fn callback_dispose(blk: *mut RustCallbackBlock) {
+    // SAFETY: Balances the reference this block copy holds.
+    unsafe {
+        let ptr = (*blk).ctx;
+        if !ptr.is_null() {
+            drop(Arc::from_raw(ptr));
+            (*blk).ctx = std::ptr::null();
+        }
+    }
+}
+
+unsafe extern "C" fn callback_invoke(blk: *mut RustCallbackBlock, arg: isize) {
+    // SAFETY: `ctx` points to a live `CallbackFn` while any copy of the block exists.
+    let f = unsafe { &*(*blk).ctx }
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(f) = f {
+        f(arg);
+    }
+}
+
+static CALLBACK_DESCRIPTOR: RustCallbackDescriptor = RustCallbackDescriptor {
+    reserved: 0,
+    size: std::mem::size_of::<RustCallbackBlock>(),
+    copy_helper: callback_copy,
+    dispose_helper: callback_dispose,
+};
+
+/// Calls `api` with a block that runs `f(first_arg)` when Cocoa invokes it.
+/// Cocoa copies completion handlers it keeps, so the stack block may go away
+/// once `api` returns. A `BOOL` argument arrives in the low byte of `first_arg`.
+pub(crate) fn with_callback_block(f: impl FnOnce(isize) + Send + 'static, api: impl FnOnce(Id)) {
+    let ctx: Arc<CallbackFn> = Arc::new(Mutex::new(Some(Box::new(f))));
+    // SAFETY: `_NSConcreteStackBlock` is the standard stack-block isa symbol exported by libSystem.
+    let isa = unsafe { _NSConcreteStackBlock };
+    let mut blk = RustCallbackBlock {
+        isa,
+        flags: 1 << 25, // BLOCK_HAS_COPY_DISPOSE
+        reserved: 0,
+        invoke: callback_invoke,
+        descriptor: &CALLBACK_DESCRIPTOR,
+        ctx: Arc::into_raw(ctx),
+    };
+    api((&raw mut blk).cast::<c_void>());
+    // SAFETY: Balances `Arc::into_raw` above; heap copies hold their own references.
+    unsafe { drop(Arc::from_raw(blk.ctx)) };
+}
 
 /// Runs `f` with a stack-allocated Objective-C `void (^)(NSModalResponse)` completion block,
 /// pumping the AppKit modal run-loop until completion fires.

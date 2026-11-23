@@ -7,7 +7,7 @@ use crate::Result;
 use crate::backend::{self, Runtime};
 use crate::event::Event;
 use crate::menu::Menu;
-use crate::window::{Display, Theme, Window, WindowSpec};
+use crate::window::{Monitor, Theme, Window, WindowSpec};
 
 /// Starts the desktop UI application, handles CEF subprocess re-entry transparently,
 /// runs `init(&app)` on the main thread, and drives the host run-loop until exit.
@@ -37,6 +37,33 @@ impl App {
         self.runtime.notify(title.to_owned(), body.to_owned());
     }
 
+    /// Shows a notification and returns its id. Clicking it delivers
+    /// `Event::NotificationClicked(id)` (and `ui:notification:click` to pages).
+    ///
+    /// From an `.app` bundle this uses the system notification center (asking
+    /// for permission the first time) with the app's own icon. An unbundled
+    /// `cargo run` binary falls back to `osascript`: no clicks or removal.
+    pub fn show_notification(&self, notification: Notification) -> String {
+        self.runtime.show_notification(notification)
+    }
+
+    /// Removes a notification shown (or queued) with [`show_notification`](Self::show_notification).
+    pub fn remove_notification(&self, id: &str) {
+        self.runtime.remove_notification(id.to_owned());
+    }
+
+    /// Reports whether notifications may be shown, without asking. `f` runs on
+    /// a background thread.
+    pub fn notification_permission(&self, f: impl FnOnce(NotificationPermission) + Send + 'static) {
+        self.runtime.notification_permission(Box::new(f));
+    }
+
+    /// Asks for permission to show notifications (the system prompt appears
+    /// once). `f` gets the answer on a background thread.
+    pub fn request_notification_permission(&self, f: impl FnOnce(bool) + Send + 'static) {
+        self.runtime.request_notification_permission(Box::new(f));
+    }
+
     pub fn open_external(&self, url: &str) -> Result<()> {
         self.runtime.open_external(url)
     }
@@ -60,8 +87,14 @@ impl App {
         self.runtime.app_theme()
     }
 
-    pub fn displays(&self) -> Vec<Display> {
+    /// Connected monitors.
+    pub fn monitors(&self) -> Vec<Monitor> {
         self.runtime.displays()
+    }
+
+    #[deprecated(since = "0.2.0", note = "renamed to `monitors`")]
+    pub fn displays(&self) -> Vec<Monitor> {
+        self.monitors()
     }
 
     /// Handle to an item of the current app menu by id, to change its title,
@@ -230,7 +263,11 @@ mod tests {
 
     #[test]
     fn second_instance_args_round_trip() {
-        let args = vec!["myapp://open?x=1".to_owned(), "--flag".to_owned(), "a b.txt".to_owned()];
+        let args = vec![
+            "myapp://open?x=1".to_owned(),
+            "--flag".to_owned(),
+            "a b.txt".to_owned(),
+        ];
         assert_eq!(decode_args(&encode_args(&args)), args);
         assert!(decode_args(&encode_args(&[])).is_empty());
     }
@@ -247,4 +284,59 @@ impl Drop for SingleInstance {
 pub struct AppInfo {
     pub name: String,
     pub version: Option<String>,
+}
+
+/// Permission to show notifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationPermission {
+    /// Not asked yet; the first notification asks.
+    NotDetermined,
+    Denied,
+    Authorized,
+    /// Not running from an app bundle: notifications use a fallback that can't
+    /// be clicked or removed.
+    Unbundled,
+}
+
+/// A notification for [`App::show_notification`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notification {
+    pub(crate) id: Option<String>,
+    pub(crate) title: String,
+    pub(crate) subtitle: Option<String>,
+    pub(crate) body: String,
+    pub(crate) sound: bool,
+}
+
+impl Notification {
+    pub fn new(title: impl Into<String>) -> Self {
+        Self {
+            id: None,
+            title: title.into(),
+            subtitle: None,
+            body: String::new(),
+            sound: true,
+        }
+    }
+
+    pub fn body(mut self, body: impl Into<String>) -> Self {
+        self.body = body.into();
+        self
+    }
+
+    pub fn subtitle(mut self, subtitle: impl Into<String>) -> Self {
+        self.subtitle = Some(subtitle.into());
+        self
+    }
+
+    /// A stable id: showing another notification with the same id replaces it.
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    pub fn sound(mut self, on: bool) -> Self {
+        self.sound = on;
+        self
+    }
 }

@@ -43,13 +43,32 @@ pub enum WindowState {
     Fullscreen,
 }
 
-/// Monitor / display descriptor.
+/// A monitor: its name, bounds, scale and whether it's the primary one.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Display {
+pub struct Monitor {
     pub name: String,
     pub bounds: Bounds,
     pub scale: f64,
     pub primary: bool,
+}
+
+/// Renamed to [`Monitor`]: `Display` clashes with `std::fmt::Display`.
+#[deprecated(since = "0.2.0", note = "renamed to `Monitor`")]
+pub type Display = Monitor;
+
+/// Where the window controls (close, minimize, zoom; caption buttons on
+/// Windows and Linux) sit in an [`TitleBar::Overlay`] title bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WindowControls {
+    pub x: u32,
+    pub y: u32,
+}
+
+impl WindowControls {
+    /// Places the first control's top-left corner at `(x, y)` points.
+    pub const fn at(x: u32, y: u32) -> Self {
+        Self { x, y }
+    }
 }
 
 /// Window chrome style across macOS, Windows, and Linux.
@@ -58,46 +77,76 @@ pub enum TitleBar {
     /// Standard OS titlebar and window frame.
     #[default]
     Native,
-    /// Content extends beneath a transparent header strip (`height` logical points).
-    /// On macOS, `.traffic_lights(x, y)` optionally offsets the standard window controls.
-    Inset {
+    /// The page draws under a transparent title-bar strip `height` points tall,
+    /// with the window controls on top (the web's Window Controls Overlay).
+    Overlay {
         height: u32,
-        traffic_lights: Option<(u32, u32)>,
+        window_controls: Option<WindowControls>,
     },
-    /// Borderless / chromeless window frame.
-    Hidden,
+    /// No frame or title bar at all.
+    Frameless,
 }
 
+#[allow(non_upper_case_globals)]
 impl TitleBar {
-    /// Creates an inset titlebar with a unified drag/header strip height in logical points.
-    pub const fn inset(height: u32) -> Self {
-        Self::Inset {
+    /// An overlay title bar `height` points tall.
+    pub const fn overlay(height: u32) -> Self {
+        Self::Overlay {
             height,
-            traffic_lights: None,
+            window_controls: None,
         }
     }
 
-    /// Sets custom traffic-light `(x, y)` inset coordinates for `TitleBar::Inset`.
-    pub const fn traffic_lights(self, x: u32, y: u32) -> Self {
+    /// Positions the window controls in an `Overlay` title bar.
+    pub const fn window_controls(self, controls: WindowControls) -> Self {
         match self {
-            Self::Inset { height, .. } => Self::Inset {
+            Self::Overlay { height, .. } => Self::Overlay {
                 height,
-                traffic_lights: Some((x, y)),
+                window_controls: Some(controls),
             },
             other => other,
         }
     }
+
+    #[deprecated(since = "0.2.0", note = "renamed to `TitleBar::overlay`")]
+    pub const fn inset(height: u32) -> Self {
+        Self::overlay(height)
+    }
+
+    #[deprecated(
+        since = "0.2.0",
+        note = "use `.window_controls(WindowControls::at(x, y))`"
+    )]
+    pub const fn traffic_lights(self, x: u32, y: u32) -> Self {
+        self.window_controls(WindowControls::at(x, y))
+    }
+
+    #[deprecated(since = "0.2.0", note = "renamed to `TitleBar::Frameless`")]
+    pub const Hidden: Self = Self::Frameless;
 }
 
-/// Native window material / translucency backdrop.
+/// Window background material, by purpose. Exact platform materials are a
+/// platform-extension concern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backdrop {
     #[default]
     None,
+    /// A sidebar's translucent material.
     Sidebar,
-    Transient,
-    Mica,
-    Acrylic,
+    /// A popover or menu-like transient panel.
+    Popover,
+    /// The material behind a whole window (Mica-like on Windows).
+    Window,
+}
+
+#[allow(non_upper_case_globals)]
+impl Backdrop {
+    #[deprecated(since = "0.2.0", note = "renamed to `Backdrop::Popover`")]
+    pub const Transient: Self = Self::Popover;
+    #[deprecated(since = "0.2.0", note = "use `Backdrop::Window`")]
+    pub const Mica: Self = Self::Window;
+    #[deprecated(since = "0.2.0", note = "use `Backdrop::Window`")]
+    pub const Acrylic: Self = Self::Window;
 }
 
 /// macOS native window tabbing behavior (`NSWindowTabbingMode`).
@@ -169,6 +218,15 @@ impl WindowBuilder {
         self
     }
 
+    pub(crate) fn set_tabbing(&mut self, tabbing: Tabbing) {
+        self.spec.tabbing = tabbing;
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn macos_tabbing(&self) -> Option<Tabbing> {
+        self.spec.macos.tabbing
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn map_macos(
         mut self,
@@ -223,6 +281,10 @@ impl WindowBuilder {
         self
     }
 
+    #[deprecated(
+        since = "0.2.0",
+        note = "macOS-only: use `.macos(|m| m.tabbing(..))` with `ui::macos::WindowBuilderExt`"
+    )]
     pub fn tabbing(mut self, tabbing: Tabbing) -> Self {
         self.spec.tabbing = tabbing;
         self

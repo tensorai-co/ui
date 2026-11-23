@@ -15,7 +15,10 @@ pub fn render_appx_manifest(meta: &AppMetadata, executable: &str, publisher: &st
     if !meta.document_types.is_empty() {
         ext.push_str("\n        <uap:Extension Category=\"windows.fileTypeAssociation\">\n          <uap:FileTypeAssociation Name=\"documents\">\n            <uap:SupportedFileTypes>");
         for t in &meta.document_types {
-            ext.push_str(&format!("\n              <uap:FileType>.{}</uap:FileType>", t.trim_start_matches('.')));
+            ext.push_str(&format!(
+                "\n              <uap:FileType>.{}</uap:FileType>",
+                t.trim_start_matches('.')
+            ));
         }
         ext.push_str("\n            </uap:SupportedFileTypes>\n          </uap:FileTypeAssociation>\n        </uap:Extension>");
     }

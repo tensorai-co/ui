@@ -88,6 +88,8 @@ function opened() {
 
 const APP_EVENTS = { "open-url": "ui:app:open-url", "open-files": "ui:app:open-files" };
 
+const notificationClickOffs = new Map();
+
 const BUTTONS = { ok: "ok", okCancel: "ok_cancel", yesNo: "yes_no", yesNoCancel: "yes_no_cancel" };
 
 /** Typed wrappers for the standard page calls (see `WebViewBuilder::standard_rpcs`). */
@@ -173,6 +175,30 @@ export const ui = Object.freeze({
     setDocumentEdited: (edited) => call("ui:window.setDocumentEdited", !!edited),
     setTheme: (theme) => ipc.window.setTheme(theme),
   }),
+  webview: Object.freeze({
+    /** Finds text and selects the next match; true/false, or null when the engine can't tell (CEF). */
+    find(text, options = {}) {
+      if (!isNative()) return Promise.resolve(null);
+      return call("ui:webview.find", {
+        text: String(text),
+        case_sensitive: options.caseSensitive,
+        backwards: options.backwards,
+        wraps: options.wraps,
+      });
+    },
+    clearFind: () => (isNative() ? call("ui:webview.clearFind") : Promise.resolve()),
+    print() {
+      if (!isNative()) {
+        window.print();
+        return Promise.resolve();
+      }
+      return call("ui:webview.print");
+    },
+    /** The page as PDF bytes (WebKit). */
+    pdf: () => call("ui:webview.pdf"),
+    /** Files dropped on the page, with real paths: fn({ paths, x, y }). WebKit. */
+    onFileDrop: (fn) => ipc.on("ui:file-drop", fn),
+  }),
   menu: Object.freeze({
     on: (id, fn) => ipc.menu.on(id, fn),
     set: (update) => ipc.menu.set(update),
@@ -182,7 +208,45 @@ export const ui = Object.freeze({
     if (!isNative()) return Promise.resolve(null);
     return ipc.contextMenu(items, position);
   },
-  notify(title, body) {
-    return call("ui:notify", String(title), body == null ? null : String(body));
+  /**
+   * Shows a notification; resolves to its id. `onClick` runs when it's clicked
+   * (bundled apps only). Web: uses the Notification API when permitted.
+   */
+  async notify(title, body, options = {}) {
+    if (!isNative()) {
+      if (typeof Notification !== "undefined" && Notification.permission === "granted") {
+        const n = new Notification(title, { body, tag: options.id });
+        if (options.onClick) n.onclick = options.onClick;
+      }
+      return options.id || "";
+    }
+    const { onClick, ...rest } = options;
+    const opts = { id: rest.id, subtitle: rest.subtitle, sound: rest.sound };
+    // Listen before showing so a fast click isn't missed.
+    let wanted = opts.id;
+    const early = [];
+    const off = onClick
+      ? ipc.on("ui:notification:click", (id) => {
+          if (wanted === undefined) early.push(id);
+          else if (id === wanted) onClick(id);
+        })
+      : null;
+    const id = await call("ui:notify", String(title), body == null ? null : String(body), opts);
+    wanted = id;
+    if (onClick && early.includes(id)) onClick(id);
+    if (off) notificationClickOffs.set(id, off);
+    return id;
   },
+  notification: Object.freeze({
+    /** Removes a notification shown with `ui.notify`, and its click listener. */
+    remove(id) {
+      const off = notificationClickOffs.get(id);
+      if (off) {
+        off();
+        notificationClickOffs.delete(id);
+      }
+      if (!isNative()) return Promise.resolve();
+      return call("ui:notification.remove", String(id));
+    },
+  }),
 });

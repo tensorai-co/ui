@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::backend::macos_appkit::{self, window_ns_ids};
 use crate::backend::macos_objc::{
-    Id, NIL, Rect, Sel, call_block_isize, class, define_class, msg, ns_string, release,
-    rust_string, sel,
+    Id, NIL, Point, Rect, Sel, call_block_isize, class, define_class, msg, ns_string, release,
+    rust_string, sel, with_callback_block,
 };
 use crate::backend::{
     IpcEndpoint, IpcReplyTarget, IpcResponder, IpcRouteAction, ipc_binary_response,
@@ -18,8 +18,8 @@ use crate::event::WebViewEvent;
 use crate::ipc::encode_rpc_response;
 use crate::js_shim::SHIM_JS;
 use crate::webview::{
-    AssetHandler, IPC_SCHEME, InitialContent, LoadState, Nav, NavHandler, NavRequest, Profile,
-    Request, Response, WebViewId, WebViewSpec,
+    AssetHandler, IPC_SCHEME, InitialContent, LoadState, NavDecision, NavHandler, NavRequest,
+    Profile, Request, Response, WebViewId, WebViewSpec,
 };
 use crate::window::{Backdrop, WindowId};
 use crate::{Error, Result};
@@ -360,24 +360,24 @@ extern "C" fn decide_nav_policy(_this: Id, _sel: Sel, wk: Id, action: Id, decisi
         if let Ok(mut g) = handler.lock() {
             g(&req)
         } else {
-            Nav::Allow
+            NavDecision::Allow
         }
     } else if external_links && nav_type == 0 {
         let req = NavRequest::new(&url, main_frame);
         let init_req = NavRequest::new(&initial_url, true);
         if matches!(req.scheme(), Some("http" | "https")) && req.host() != init_req.host() {
-            Nav::External
+            NavDecision::OpenInBrowser
         } else {
-            Nav::Allow
+            NavDecision::Allow
         }
     } else {
-        Nav::Allow
+        NavDecision::Allow
     };
 
     match decision {
-        Nav::Allow => call_block_isize(decision_handler, 1),
-        Nav::Cancel => call_block_isize(decision_handler, 0),
-        Nav::External => {
+        NavDecision::Allow => call_block_isize(decision_handler, 1),
+        NavDecision::Block => call_block_isize(decision_handler, 0),
+        NavDecision::OpenInBrowser => {
             let _ = macos_appkit::open_external(&url);
             call_block_isize(decision_handler, 0);
         }
@@ -429,21 +429,21 @@ extern "C" fn create_popup_webview(
             if let Ok(mut g) = handler.lock() {
                 g(&req)
             } else {
-                Nav::Cancel
+                NavDecision::Block
             }
         } else if external_links {
-            Nav::External
+            NavDecision::OpenInBrowser
         } else {
-            Nav::Cancel
+            NavDecision::Block
         };
         match nav {
-            Nav::External => {
+            NavDecision::OpenInBrowser => {
                 let _ = macos_appkit::open_external(&url);
             }
-            Nav::Allow => {
+            NavDecision::Allow => {
                 msg!(Id; wk, "loadRequest:", ns_req => Id);
             }
-            Nav::Cancel => {}
+            NavDecision::Block => {}
         }
     }
     NIL
@@ -719,7 +719,7 @@ pub(crate) fn mount_webkit_webview(
     }
 
     let bounds = msg_bounds(content_view);
-    let wk = msg!(Id; msg!(Id; class("WKWebView"), "alloc"), "initWithFrame:configuration:",
+    let wk = msg!(Id; msg!(Id; drop_webview_class(), "alloc"), "initWithFrame:configuration:",
         bounds => Rect, cfg => Id);
     release(cfg);
     if wk.is_null() {
@@ -964,4 +964,194 @@ pub(crate) fn cleanup_webview(id: WebViewId) {
     release(rec.ui_delegate);
     release(rec.msg_handler);
     release(rec.wk_webview);
+}
+
+// ---------------------------------------------------------------------------
+// Find in page, print / PDF, file drops
+// ---------------------------------------------------------------------------
+
+/// Finds `text` in the page (macOS 11+); `f` gets whether it matched.
+pub(crate) fn find(
+    id: WebViewId,
+    text: &str,
+    case_sensitive: bool,
+    backwards: bool,
+    wraps: bool,
+    f: Box<dyn FnOnce(Option<bool>) + Send>,
+) {
+    let wk = wk_ptr_for(id);
+    let cfg_cls = class("WKFindConfiguration");
+    if wk.is_null()
+        || cfg_cls.is_null()
+        || !msg!(bool; wk, "respondsToSelector:", sel("findString:withConfiguration:completionHandler:") => Sel)
+    {
+        f(None);
+        return;
+    }
+    let cfg = msg!(Id; msg!(Id; cfg_cls, "alloc"), "init");
+    msg!((); cfg, "setCaseSensitive:", case_sensitive => bool);
+    msg!((); cfg, "setBackwards:", backwards => bool);
+    msg!((); cfg, "setWraps:", wraps => bool);
+    with_callback_block(
+        move |result| {
+            let result = result as Id;
+            f(Some(!result.is_null() && msg!(bool; result, "matchFound")));
+        },
+        |block| {
+            msg!((); wk, "findString:withConfiguration:completionHandler:",
+                ns_string(text) => Id, cfg => Id, block => Id);
+        },
+    );
+    release(cfg);
+}
+
+/// Clears the find highlight (WebKit marks the match as the selection).
+pub(crate) fn clear_find(id: WebViewId) {
+    let _ = eval(
+        id,
+        "window.getSelection && window.getSelection().removeAllRanges();",
+    );
+}
+
+/// Renders the page to PDF bytes (macOS 11+).
+pub(crate) fn pdf(id: WebViewId, f: Box<dyn FnOnce(Option<Vec<u8>>) + Send>) {
+    let wk = wk_ptr_for(id);
+    if wk.is_null()
+        || !msg!(bool; wk, "respondsToSelector:", sel("createPDFWithConfiguration:completionHandler:") => Sel)
+    {
+        f(None);
+        return;
+    }
+    with_callback_block(
+        move |data| {
+            let data = data as Id;
+            if data.is_null() {
+                f(None);
+                return;
+            }
+            let len = msg!(usize; data, "length");
+            let ptr = msg!(*const u8; data, "bytes");
+            let bytes = if ptr.is_null() || len == 0 {
+                Vec::new()
+            } else {
+                // SAFETY: `NSData.bytes` is valid for `length` bytes while the block runs.
+                unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+            };
+            f(Some(bytes));
+        },
+        |block| {
+            msg!((); wk, "createPDFWithConfiguration:completionHandler:", NIL => Id, block => Id);
+        },
+    );
+}
+
+/// Opens the system print panel for the page, as a sheet on its window.
+pub(crate) fn print(id: WebViewId) {
+    let wk = wk_ptr_for(id);
+    if wk.is_null()
+        || !msg!(bool; wk, "respondsToSelector:", sel("printOperationWithPrintInfo:") => Sel)
+    {
+        return;
+    }
+    let info = msg!(Id; class("NSPrintInfo"), "sharedPrintInfo");
+    let op = msg!(Id; wk, "printOperationWithPrintInfo:", info => Id);
+    if op.is_null() {
+        return;
+    }
+    // Without a frame the operation prints blank pages.
+    let view = msg!(Id; op, "view");
+    if !view.is_null() {
+        msg!((); view, "setFrame:", msg_bounds(wk) => Rect);
+    }
+    msg!((); op, "setShowsPrintPanel:", true => bool);
+    msg!((); op, "setShowsProgressPanel:", true => bool);
+    let win = msg!(Id; wk, "window");
+    if win.is_null() {
+        msg!(bool; op, "runOperation");
+    } else {
+        msg!((); op, "runOperationModalForWindow:delegate:didRunSelector:contextInfo:",
+            win => Id, NIL => Id, std::ptr::null::<c_void>() as Sel => Sel, std::ptr::null_mut::<c_void>() => *mut c_void);
+    }
+}
+
+#[repr(C)]
+struct ObjcSuper {
+    receiver: Id,
+    super_class: Id,
+}
+
+/// `[super performDragOperation:sender]` for the WKWebView subclass.
+fn super_perform_drag(this: Id, sender: Id) -> bool {
+    // SAFETY: `this` is a live UiWKWebView; its superclass is WKWebView.
+    unsafe {
+        let cls = crate::backend::macos_objc::object_getClass(this);
+        let sup = ObjcSuper {
+            receiver: this,
+            super_class: crate::backend::macos_objc::class_getSuperclass(cls),
+        };
+        let f: unsafe extern "C" fn(*const ObjcSuper, Sel, Id) -> bool = std::mem::transmute(
+            crate::backend::macos_objc::objc_msgSendSuper as unsafe extern "C" fn(),
+        );
+        f(&sup, sel("performDragOperation:"), sender)
+    }
+}
+
+/// Reports dropped files' real paths, then lets WebKit deliver the drop to the page.
+extern "C" fn perform_drag_operation(this: Id, _: Sel, sender: Id) -> bool {
+    if let Some(id) = WK_TO_ID.with(|m| m.borrow().get(&(this as usize)).copied())
+        && !sender.is_null()
+    {
+        let pb = msg!(Id; sender, "draggingPasteboard");
+        let classes = msg!(Id; class("NSArray"), "arrayWithObject:", class("NSURL") => Id);
+        let yes = msg!(Id; class("NSNumber"), "numberWithBool:", true => bool);
+        let opts = msg!(Id; class("NSDictionary"), "dictionaryWithObject:forKey:",
+            yes => Id, ns_string("NSPasteboardURLReadingFileURLsOnlyKey") => Id);
+        let urls = if pb.is_null() {
+            NIL
+        } else {
+            msg!(Id; pb, "readObjectsForClasses:options:", classes => Id, opts => Id)
+        };
+        let count = if urls.is_null() {
+            0
+        } else {
+            msg!(usize; urls, "count")
+        };
+        let paths: Vec<std::path::PathBuf> = (0..count)
+            .map(|i| msg!(Id; urls, "objectAtIndex:", i => usize))
+            .filter(|u| !u.is_null())
+            .map(|u| std::path::PathBuf::from(rust_string(msg!(Id; u, "path"))))
+            .collect();
+        if !paths.is_empty() {
+            let in_window = msg!(Point; sender, "draggingLocation");
+            let p = msg!(Point; this, "convertPoint:fromView:", in_window => Point, NIL => Id);
+            let flipped = msg!(bool; this, "isFlipped");
+            let h = msg_bounds(this).size.height;
+            let y = if flipped { p.y } else { h - p.y };
+            push_notification(WebKitNotification::Event(
+                id,
+                WebViewEvent::FileDrop { paths, x: p.x, y },
+            ));
+        }
+    }
+    super_perform_drag(this, sender)
+}
+
+fn drop_webview_class() -> Id {
+    static CLS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CLS.get_or_init(|| {
+        define_class(
+            "UiWKWebView",
+            "WKWebView",
+            &[(
+                "performDragOperation:",
+                perform_drag_operation as *const c_void,
+                if crate::backend::macos_objc::BOOL_ENC == "c" {
+                    "c@:@"
+                } else {
+                    "B@:@"
+                },
+            )],
+            &[],
+        ) as usize
+    }) as Id
 }

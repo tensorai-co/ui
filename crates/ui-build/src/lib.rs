@@ -98,9 +98,15 @@ fn should_build(dir_exists: bool, release: bool, flag: Option<&str>) -> bool {
 fn run_before(cmd: &str, cwd: &Path) {
     println!("cargo:warning=ui-build: running `{cmd}`");
     let status = if cfg!(windows) {
-        Command::new("cmd").args(["/C", cmd]).current_dir(cwd).status()
+        Command::new("cmd")
+            .args(["/C", cmd])
+            .current_dir(cwd)
+            .status()
     } else {
-        Command::new("sh").args(["-c", cmd]).current_dir(cwd).status()
+        Command::new("sh")
+            .args(["-c", cmd])
+            .current_dir(cwd)
+            .status()
     };
     match status {
         Ok(s) if s.success() => {}
@@ -182,7 +188,10 @@ mod tests {
 
         let files = collect(&root).unwrap();
         let rels: Vec<&str> = files.iter().map(|(r, _)| r.as_str()).collect();
-        assert_eq!(rels, ["assets/app.js", "assets/img/a \"b\".png", "index.html"]);
+        assert_eq!(
+            rels,
+            ["assets/app.js", "assets/img/a \"b\".png", "index.html"]
+        );
 
         let code = generate(&files);
         assert!(code.starts_with("// @generated"));

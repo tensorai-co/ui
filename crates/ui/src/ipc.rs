@@ -1712,7 +1712,10 @@ mod tests {
 
     #[test]
     fn ipc_struct_round_trip_and_errors() {
-        let req = ExportRequest { path: "a.pdf".into(), pages: Some(3) };
+        let req = ExportRequest {
+            path: "a.pdf".into(),
+            pages: Some(3),
+        };
         let val = req.clone().into_ipc();
         assert_eq!(ExportRequest::from_ipc(&val).unwrap(), req);
 
@@ -1722,13 +1725,19 @@ mod tests {
         assert_eq!(decoded.pages, None);
 
         let err = ExportRequest::from_ipc(&Value::Object(Default::default())).unwrap_err();
-        assert!(err.to_string().contains("missing IPC field \"path\""), "{err}");
+        assert!(
+            err.to_string().contains("missing IPC field \"path\""),
+            "{err}"
+        );
         assert!(ExportRequest::from_ipc(&Value::Null).is_err());
     }
 
     #[test]
     fn titlebar_double_click_packet() {
-        assert_eq!(decode_send_packet(&[0x04]).unwrap(), ClientSendPacket::TitlebarDoubleClick);
+        assert_eq!(
+            decode_send_packet(&[0x04]).unwrap(),
+            ClientSendPacket::TitlebarDoubleClick
+        );
         assert!(decode_send_packet(&[0x04, 0x00]).is_err());
     }
 
@@ -1741,7 +1750,13 @@ mod tests {
         rpc.push(WIRE_NULL);
         let (method, arg, call) = decode_rpc_request(&rpc).unwrap();
         assert_eq!((method.as_str(), arg), ("go", Value::Null));
-        assert_eq!(call, CallSpec { id: Some(7), stream: true });
+        assert_eq!(
+            call,
+            CallSpec {
+                id: Some(7),
+                stream: true
+            }
+        );
 
         // A stream without a call id, and unknown flags, are rejected.
         assert!(decode_rpc_request(&[0x02, 0, 0, WIRE_NULL]).is_err());
@@ -1749,7 +1764,10 @@ mod tests {
 
         let mut cancel = vec![0x05];
         cancel.extend_from_slice(&9u32.to_le_bytes());
-        assert_eq!(decode_send_packet(&cancel).unwrap(), ClientSendPacket::Cancel(9));
+        assert_eq!(
+            decode_send_packet(&cancel).unwrap(),
+            ClientSendPacket::Cancel(9)
+        );
         assert!(decode_send_packet(&[0x05, 1, 0]).is_err());
 
         let mut data = vec![0x06];

@@ -31,15 +31,24 @@ pub fn run(meta: &AppMetadata, opts: &RunOptions) -> Result<i32, String> {
     let mut dev_server: Option<Child> = None;
     let mut cmd = Command::new(&bin);
     cmd.args(&opts.app_args);
+    // Unbundled binaries show a generic Dock icon; point them at the app's.
+    if let Some(icon) = &meta.icon {
+        cmd.env("UI_DOCK_ICON", meta.manifest_dir.join(icon));
+    }
     if opts.dev {
-        let url = meta.dev_url.clone().unwrap_or_else(|| "http://localhost:5173".into());
+        let url = meta
+            .dev_url
+            .clone()
+            .unwrap_or_else(|| "http://localhost:5173".into());
         if let Some(dev_cmd) = &meta.dev_command {
             eprintln!("ui-pack: starting `{dev_cmd}`");
             dev_server = Some(shell(dev_cmd, &meta.manifest_dir)?);
         }
         cmd.env("UI_DEV_URL", &url);
     }
-    let status = cmd.status().map_err(|e| format!("launch {}: {e}", bin.display()));
+    let status = cmd
+        .status()
+        .map_err(|e| format!("launch {}: {e}", bin.display()));
     if let Some(mut child) = dev_server {
         let _ = child.kill();
         let _ = child.wait();
@@ -57,15 +66,21 @@ fn shell(cmd: &str, cwd: &Path) -> Result<Child, String> {
         c.args(["-c", cmd]);
         c
     };
-    c.current_dir(cwd).spawn().map_err(|e| format!("start `{cmd}`: {e}"))
+    c.current_dir(cwd)
+        .spawn()
+        .map_err(|e| format!("start `{cmd}`: {e}"))
 }
 
 /// Runs `cargo build` for the package and returns the built binary's path.
 fn cargo_build(manifest: &Path, bin_name: &str, release: bool) -> Result<PathBuf, String> {
     let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
-    cmd.args(["build", "--message-format=json-render-diagnostics", "--manifest-path"])
-        .arg(manifest)
-        .args(["--bin", bin_name]);
+    cmd.args([
+        "build",
+        "--message-format=json-render-diagnostics",
+        "--manifest-path",
+    ])
+    .arg(manifest)
+    .args(["--bin", bin_name]);
     if release {
         cmd.arg("--release");
     }
@@ -157,7 +172,13 @@ mod tests {
     #[test]
     fn reads_executable_from_cargo_json() {
         let line = r#"{"reason":"compiler-artifact","target":{"name":"app"},"executable":"/w/target/debug/my\"app","fresh":true}"#;
-        assert_eq!(executable_of(line), Some(PathBuf::from("/w/target/debug/my\"app")));
-        assert_eq!(executable_of(r#"{"reason":"compiler-artifact","executable":null}"#), None);
+        assert_eq!(
+            executable_of(line),
+            Some(PathBuf::from("/w/target/debug/my\"app"))
+        );
+        assert_eq!(
+            executable_of(r#"{"reason":"compiler-artifact","executable":null}"#),
+            None
+        );
     }
 }

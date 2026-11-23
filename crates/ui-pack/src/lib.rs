@@ -1,5 +1,6 @@
 //! Release bundler and signer (`ui-pack`) for `.app`, Mac App Store `.pkg`, Windows MSIX, and Linux bundles.
 
+pub mod cli;
 pub mod linux;
 pub mod macos;
 pub mod metadata;
@@ -31,14 +32,46 @@ mod tests {
         assert!(plist.contains("<key>CFBundleURLSchemes</key>"));
         assert!(plist.contains("<string>notes-dev</string>"));
         assert!(plist.contains("<key>CFBundleTypeExtensions</key>"));
-        assert!(plist.contains("<string>txt</string>"), "leading dot stripped");
+        assert!(
+            plist.contains("<string>txt</string>"),
+            "leading dot stripped"
+        );
         assert!(plist.contains("<key>CFBundleIconFile</key>\n  <string>AppIcon.icns</string>"));
 
         let appx = render_appx_manifest(&meta, "notes.exe", "CN=Example");
         assert!(appx.contains(r#"<uap:Protocol Name="notes" />"#));
         assert!(appx.contains("<uap:FileType>.md</uap:FileType>"));
-        assert!(render_desktop_entry(&meta, "notes")
-            .contains("MimeType=x-scheme-handler/notes;x-scheme-handler/notes-dev;"));
+        assert!(
+            render_desktop_entry(&meta, "notes")
+                .contains("MimeType=x-scheme-handler/notes;x-scheme-handler/notes-dev;")
+        );
+    }
+
+    #[test]
+    fn inline_entitlements_and_notarize_commands() {
+        let meta = AppMetadata::parse(
+            "[package]\nname = \"vm\"\n[package.metadata.ui.entitlements]\n\
+             \"com.apple.security.hypervisor\" = true\n\"com.apple.security.cs.allow-jit\" = false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            meta.entitlement_keys,
+            [
+                ("com.apple.security.hypervisor".to_owned(), true),
+                ("com.apple.security.cs.allow-jit".to_owned(), false)
+            ]
+        );
+        let path = super::macos::entitlements_path(&meta).expect("inline entitlements written");
+        let plist = std::fs::read_to_string(&path).unwrap();
+        assert!(plist.contains("<key>com.apple.security.hypervisor</key>\n  <true/>"));
+        assert!(plist.contains("<key>com.apple.security.cs.allow-jit</key>\n  <false/>"));
+        let _ = std::fs::remove_file(path);
+
+        let cmds = super::macos::notarize_commands(std::path::Path::new("/o/My App.app"), "prof");
+        assert_eq!(cmds[0][..4], ["ditto", "-c", "-k", "--keepParent"]);
+        assert_eq!(cmds[1][..3], ["xcrun", "notarytool", "submit"]);
+        assert!(cmds[1].ends_with(&["--keychain-profile".into(), "prof".into(), "--wait".into()]));
+        assert_eq!(cmds[2], ["xcrun", "stapler", "staple", "/o/My App.app"]);
     }
 
     #[test]
@@ -81,6 +114,7 @@ backend = "webkit"
                 channel: MacChannel::AppStore,
                 cef_framework: None,
                 sign: None,
+                notarize: None,
             },
         )
         .unwrap_err();
@@ -127,6 +161,7 @@ backend = "webkit"
                 channel: MacChannel::Direct,
                 cef_framework: None,
                 sign: None,
+                notarize: None,
             },
         )
         .unwrap();

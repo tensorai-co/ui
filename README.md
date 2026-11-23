@@ -49,13 +49,13 @@ fn main() -> ui::Result<()> {
         let win = Window::new("My App")
             .size(1280, 840)
             .min_size(760, 520)
-            .title_bar(TitleBar::inset(38).traffic_lights(14, 12))
+            .title_bar(TitleBar::overlay(38).window_controls(WindowControls::at(14, 12)))
             .backdrop(Backdrop::Sidebar)
             .open(app)?;
 
         WebView::new()
             .assets("app", serve) // serves app://localhost/index.html with MIME inference
-            .inspectable(cfg!(debug_assertions))
+            .devtools(cfg!(debug_assertions))
             .invoke("open_project", |ctx, ()| ctx.window().dialog().pick_folder())
             .invoke("transform", |_ctx, (name, raw): (String, Bytes)| {
                 let flipped: Vec<u8> = raw.0.into_iter().map(|b| !b).collect();
@@ -148,7 +148,7 @@ Window options live there too, along with the cross-platform `restore_state`:
 use ui::macos::{ToolbarStyle, WindowBuilderExt, WindowExt, WindowLevel};
 
 let win = Window::new("Editor")
-    .title_bar(TitleBar::inset(52))
+    .title_bar(TitleBar::overlay(52))
     .restore_state("main") // frame, monitor and full screen remembered across launches
     .macos(|m| m.toolbar_style(ToolbarStyle::Unified).titlebar_separator(false))
     .open(app)?;
@@ -159,6 +159,22 @@ win.macos().set_level(WindowLevel::Floating);
 `MacWindowOptions` also has `window_controls_visible`, `all_spaces` and `fullscreen_auxiliary`; `ui::macos::forget_window_state(name)` resets a saved layout.
 
 Native context menus are also available from Rust: `window.popup_menu(vec![ContextMenuItem::new("rename", "Rename")], x, y)` returns the chosen id.
+
+### Notifications
+
+```rust
+let id = app.show_notification(
+    ui::Notification::new("Build finished").body("All 112 tests passed").id("build"),
+);
+app.on_event(|ev| if let Event::NotificationClicked(id) = ev { /* … */ });
+app.remove_notification("build");
+```
+
+From an `.app` bundle these use the system notification center, with the app's own icon, clicks (`Event::NotificationClicked`, and `onClick` in `ui.notify(title, body, { onClick })`) and removal; permission is asked the first time (`app.request_notification_permission(..)` / `app.notification_permission(..)` to check without asking). Unbundled `cargo run` binaries fall back to `osascript`, which can't be clicked or removed.
+
+### Webview Extras
+
+`webview.find(text, FindOptions::default(), |found| …)` / `clear_find()` (find in page; CEF can't report matches), `print()`, `pdf(|bytes| …)` (WebKit), and `WebViewEvent::FileDrop { paths, x, y }` with real filesystem paths for dropped files (WebKit; pages also get `ui:file-drop`). Page zoom set with `set_zoom` or the View menu is remembered per profile. With `.standard_rpcs(..)`, pages reach these as `ui.webview.find / clearFind / print / pdf / onFileDrop`. `.mirror_theme()` makes the window's appearance follow the page's `<html data-theme>`.
 
 ### Deep Links, Opened Files & Single Instance
 
@@ -179,10 +195,15 @@ app.on_event(|ev| match ev {
 
 Pages get the same with `ui.app.on("open-url", fn)` / `ui.app.on("open-files", fn)` from `ui-client`, including a link that launched the app before the page loaded. `SingleInstance::acquire` in a second launch returns `Ok(None)` and forwards its arguments; the running app calls `instance.listen(&app)` to receive them as `Event::SecondInstance` (URL arguments also arrive as `Event::OpenUrl`).
 
+### Renamed in 0.2
+
+v1 names still compile as `#[deprecated]` aliases for one release, each pointing at its replacement: `TitleBar::inset(..).traffic_lights(x, y)` → `TitleBar::overlay(..).window_controls(WindowControls::at(x, y))`, `TitleBar::Hidden` → `Frameless`, `Backdrop::{Transient, Mica, Acrylic}` → `Popover` / `Window`, `Role::Zoom` → `Maximize`, `Event::Reopen` → `Activate`, `Shortcut::cmd(_shift)` → `primary(_shift)`, `.inspectable` → `.devtools`, `.rpc` → `.invoke`, `.on_msg` → `.on_command`, `Nav::{Cancel, External}` → `NavDecision::{Block, OpenInBrowser}`, `.on_popup` → `.on_new_window`, `.external_links` → `.open_links_in_browser`, `Display` / `displays()` → `Monitor` / `monitors()`, `Mod` → `Modifiers`, `Ctx` → `Context`, `WindowBuilder::tabbing` → `.macos(|m| m.tabbing(..))`, and in JS `ipc.send` → `ipc.emit`.
+
 ### Hosted URL App & Typed Commands
 
 ```rust
-use ui::{Nav, Profile, Tabbing, TitleBar, WebView, Window};
+use ui::macos::{Tabbing, WindowBuilderExt};
+use ui::{NavDecision, Profile, TitleBar, WebView, Window};
 
 ui::ipc_enum! {
     enum AppCmd {
@@ -198,18 +219,18 @@ fn main() -> ui::Result<()> {
         let win = Window::new("Example App")
             .size(1200, 800)
             .title_bar(TitleBar::Native)
-            .tabbing(Tabbing::Disallowed)
+            .macos(|m| m.tabbing(Tabbing::Disallowed))
             .open(app)?;
 
         WebView::url("https://example.com")
             .profile(Profile::persistent("default"))
             .on_navigate(|req| match req.host() {
-                Some("example.com") => Nav::Allow,
-                Some(_) => Nav::External,
-                None => Nav::Allow,
+                Some("example.com") => NavDecision::Allow,
+                Some(_) => NavDecision::OpenInBrowser,
+                None => NavDecision::Allow,
             })
-            .on_popup(|_req| Nav::External)
-            .on_msg::<AppCmd>(|ctx, cmd| match cmd {
+            .on_new_window(|_req| NavDecision::OpenInBrowser)
+            .on_command::<AppCmd>(|ctx, cmd| match cmd {
                 AppCmd::SetTitle { title } => ctx.window().set_title(&title),
                 AppCmd::Notify { title, body } => ctx.app().notify(&title, &body),
             })
@@ -243,7 +264,7 @@ const exitCode = await term.closed; // the handler's return value
 // Fire-and-forget renderer -> host messages (`send` is the v1 name for `emit`)
 ipc.emit("ready");
 ipc.emit("upload", arrayBufferOrUint8Array);
-ipc.emit({ type: "set_title", title: "Updated Title" }); // dispatches to on_msg::<AppCmd>
+ipc.emit({ type: "set_title", title: "Updated Title" }); // dispatches to on_command::<AppCmd>
 
 // Window appearance, independent of the system's
 await ipc.window.setTheme("dark"); // or "light" / "system"
@@ -331,18 +352,18 @@ UI_BACKEND=webkit cargo test -p ui --test conformance --features cef
 
 ## API Overview
 
-Root `ui::*` re-exports the core surface (`run`, `App`, `SingleInstance`, `Window`, `WebView`, `Ctx`, `Stream`, `TitleBar`, `Backdrop`, `Tabbing`, `Profile`, `Nav`, `NavRequest`, `Request`, `Response`, `Menu`, `Dialog`, `Bytes`, `Value`, `DecodeError`, `FromIpc`, `IntoIpc`, `RpcResult`, `Error`, `Result`, `json!`, `ipc_enum!`, `ipc_struct!`), organized into focused submodules:
+Root `ui::*` re-exports the core surface (`run`, `App`, `SingleInstance`, `Window`, `WebView`, `Context`, `Stream`, `TitleBar`, `WindowControls`, `Backdrop`, `Monitor`, `Profile`, `NavDecision`, `NavRequest`, `FindOptions`, `Notification`, `Request`, `Response`, `Menu`, `Dialog`, `Bytes`, `Value`, `DecodeError`, `FromIpc`, `IntoIpc`, `RpcResult`, `Error`, `Result`, `json!`, `ipc_enum!`, `ipc_struct!`), organized into focused submodules:
 
 ```text
 ui
 ├── app        // run, App, SingleInstance
-├── window     // Window, WindowBuilder, WindowId, TitleBar, Backdrop, Tabbing, Bounds, Display, Theme, WindowState
-├── webview    // WebView, WebViewBuilder, WebViewId, Ctx, Request, Response, Mime, Nav, NavRequest, Profile, LoadState
+├── window     // Window, WindowBuilder, WindowId, TitleBar, WindowControls, Backdrop, Bounds, Monitor, Theme, WindowState
+├── webview    // WebView, WebViewBuilder, WebViewId, Context, Request, Response, Mime, NavDecision, NavRequest, Profile, LoadState, FindOptions
 ├── embed      // Embedded (+ embedded!), served with WebViewBuilder::bundle
 ├── ipc        // Bytes, Value, FromIpc, IntoIpc, DecodeError, RpcResult (+ json!, ipc_enum!, ipc_struct!)
-├── menu       // Menu, Submenu, MenuItem, MenuItemHandle, MenuItemUpdate, ContextMenuItem, Role, Shortcut, Mod
+├── menu       // Menu, Submenu, MenuItem, MenuItemHandle, MenuItemUpdate, ContextMenuItem, Role, Shortcut, Modifiers
 ├── standard   // StandardRpcs (ui.app / dialog / clipboard / window / notify page calls)
-├── macos      // AppExt, MacApp, Dock, Attention (macOS only)
+├── macos      // AppExt, WindowBuilderExt, WindowExt, Dock, MacWindowOptions, ToolbarStyle, Tabbing (macOS only)
 ├── dialog     // Dialog, FileDialog, MessageDialog, Filter, MessageLevel, MessageButtons, MessageResult
 ├── event      // Event, WindowEvent, WebViewEvent
 ├── platform   // RawWindowHandle, RawWebViewHandle
@@ -363,9 +384,17 @@ ui
 cargo run -p ui-pack -- macos --manifest path/to/Cargo.toml --bin target/release/my-app --out target/pack [--sign "Developer ID Application: …"]
 cargo run -p ui-pack -- run --manifest path/to/Cargo.toml [--release] [--dev]   # build, sign with entitlements, launch
 cargo run -p ui-pack -- icons assets/app-icon.png                              # AppIcon.iconset + AppIcon.icns
+cargo ui run --dev                                                             # same commands via the cargo-ui binary
 ```
 
-`[package.metadata.ui]` also takes `url_schemes`, `document_types`, `entitlements = "app.entitlements"` (used to sign `macos` bundles and `run` binaries, and as the Mac App Store entitlements), and `dev_command` / `dev_url` for `ui-pack run --dev`, which starts the web dev server and sets `UI_DEV_URL`. An `icon` ending in `.icns` is copied into the bundle.
+Notarize a Developer ID build with `ui-pack macos --sign "Developer ID Application: …" --notarize <keychain-profile>` (zips, submits with `notarytool --wait`, staples). Entitlements can also be inline:
+
+```toml
+[package.metadata.ui.entitlements]
+"com.apple.security.hypervisor" = true
+```
+
+`[package.metadata.ui]` also takes `url_schemes`, `document_types`, `entitlements = "app.entitlements"` (used to sign `macos` bundles and `run` binaries, and as the Mac App Store entitlements), and `dev_command` / `dev_url` for `ui-pack run --dev`, which starts the web dev server and sets `UI_DEV_URL`. An `icon` ending in `.icns` is copied into the bundle, and `ui-pack run` shows it in the Dock for the unbundled binary (`UI_DOCK_ICON`).
 
 - **`macos`**: Assembles `<DisplayName>.app`; for `backend = "cef"`, bundles `Chromium Embedded Framework.framework` and helper `.app` processes inside `Contents/Frameworks/` with `CFBundleIdentifier` aligned to `bundle_id`.
 - **`mac-app-store`** (alias `mas`): Builds a sandboxed Mac App Store `.app` + `entitlements.mas.plist` (`com.apple.security.app-sandbox`) using the system webview (`backend = "cef"` is rejected).
@@ -381,10 +410,10 @@ Renderer and host communication runs over the reserved `ui-ipc://ipc/` custom sc
 
 ```text
 Renderer -> Host
-  ipc.invoke(method, arg) ──▶ POST ui-ipc://ipc/rpc   ──▶ UI thread .rpc(..)      ──▶ ArrayBuffer reply
+  ipc.invoke(method, arg) ──▶ POST ui-ipc://ipc/rpc   ──▶ UI thread .invoke(..)      ──▶ ArrayBuffer reply
   ipc.invoke(.., {signal}) ─▶ POST ui-ipc://ipc/rpc (+call id) ─▶ worker .invoke_blocking ─▶ reply via UI thread
   ipc.stream(method, ..)  ──▶ POST ui-ipc://ipc/rpc (+call id, stream) ─▶ worker .invoke_stream ─▶ frames on __ui_stream:<id>
-  ipc.emit(ev, arg)       ──▶ POST ui-ipc://ipc/send  ──▶ UI thread .on/.on_msg   ──▶ 200 OK
+  ipc.emit(ev, arg)       ──▶ POST ui-ipc://ipc/send  ──▶ UI thread .on/.on_command ──▶ 200 OK
 
 Host -> Renderer (queued + coalesced)
   ctx.emit / wv.emit      ──▶ push frame to per-webview queue ──▶ empty->non-empty: window.__ipc_wake()
@@ -412,12 +441,12 @@ Host -> Renderer (queued + coalesced)
 | :--- | :--- | :--- | :--- |
 | **Lifecycle, bounds, focus** | Child `WKWebView` | Child `CefBrowser` `NSView` | Logical points; host handles resize & DPI |
 | **Navigation, HTML & zoom** | `loadRequest` / `loadHTMLString` / `pageZoom` | `load_url` / `data:` HTML / `set_zoom_level` | `back`, `forward`, `reload`, `load_state`, `current_url`, `title` |
-| **Nav policy & popups** | Navigation & UI delegates | `on_before_browse`, `on_before_popup` | `Nav::{Allow, Cancel, External}` + `external_links(bool)` |
+| **Nav policy & popups** | Navigation & UI delegates | `on_before_browse`, `on_before_popup` | `NavDecision::{Allow, Block, OpenInBrowser}` + `open_links_in_browser(bool)` |
 | **Custom schemes (`app://`)** | `WKURLSchemeHandler` | `cef_register_scheme_handler_factory` | `Request` / `Response` with CORS, headers, and POST bodies |
 | **Init scripts & binary IPC** | `WKUserScript` + `WKURLSchemeHandler` (`https://` fallback supported) | `on_context_created` + async `CefResourceHandler` | Shared `window.ipc` shim (`invoke`, `send`, `on`, `once`, `off`, `/drain`) |
 | **Storage profiles** | `WKWebsiteDataStore` (`nonPersistent` / UUID) | `cef_request_context_t` (`p_<name>` / incognito) | `Profile::{Default, persistent(name), ephemeral()}`, `clear_data()` |
-| **DevTools** | `isInspectable` (macOS 13.3+) | `show_dev_tools` via `open_devtools()` | `open_devtools()` returns `Err(Error::Unsupported)` on `webkit` |
-| **Host shell** | `TitleBar::{Native, Inset, Hidden}`, `Backdrop`, `Tabbing`, `Menu::standard()`, sheet `Dialog`, `SingleInstance` | Shared macOS `AppKit` host | Identical window, menu, and dialog API |
+| **DevTools** | `devtools(bool)` → `isInspectable` (macOS 13.3+) | `show_dev_tools` via `open_devtools()` | `open_devtools()` returns `Err(Error::Unsupported)` on `webkit` |
+| **Host shell** | `TitleBar::{Native, Overlay, Frameless}`, `Backdrop`, `ui::macos` options, `Menu::standard()`, sheet `Dialog`, `SingleInstance` | Shared macOS `AppKit` host | Identical window, menu, and dialog API |
 
 ### Environment Variables
 
@@ -429,6 +458,7 @@ Host -> Renderer (queued + coalesced)
 - `UI_HEADLESS=1`: Run pure-Rust conformance checks without launching a live window/webview.
 - `UI_DEV_URL`: In debug builds, load this `localhost` dev server in place of a webview's `assets`/`bundle` start page.
 - `UI_BUILD_WEB`: For `ui-build`, `1` always runs the `before` command and `0` never does.
+- `UI_DOCK_ICON`: Path to an image the unbundled binary shows in the Dock (set by `ui-pack run`).
 
 ### Workspace Layout
 

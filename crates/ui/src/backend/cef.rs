@@ -25,8 +25,8 @@ use crate::js_shim::SHIM_JS;
 #[cfg(not(target_os = "macos"))]
 use crate::platform;
 use crate::webview::{
-    AssetHandler, IPC_SCHEME, InitialContent, LoadState, Nav, NavHandler, NavRequest, Profile,
-    Request, Response, WebViewId, WebViewSpec,
+    AssetHandler, IPC_SCHEME, InitialContent, LoadState, NavDecision, NavHandler, NavRequest,
+    Profile, Request, Response, WebViewId, WebViewSpec,
 };
 #[cfg(target_os = "macos")]
 use crate::window::Backdrop;
@@ -957,7 +957,7 @@ impl Drop for SubHandlerData {
     }
 }
 
-fn nav_decision_for_popup(id: WebViewId, url: &str) -> Nav {
+fn nav_decision_for_popup(id: WebViewId, url: &str) -> NavDecision {
     let (popup_handler, external_links) = with_webviews(|w| {
         let rec = w.get(&id);
         (
@@ -970,16 +970,21 @@ fn nav_decision_for_popup(id: WebViewId, url: &str) -> Nav {
         if let Ok(mut g) = handler.lock() {
             g(&req)
         } else {
-            Nav::Cancel
+            NavDecision::Block
         }
     } else if external_links {
-        Nav::External
+        NavDecision::OpenInBrowser
     } else {
-        Nav::Cancel
+        NavDecision::Block
     }
 }
 
-fn nav_decision_for_browse(id: WebViewId, url: &str, main_frame: bool, user_gesture: bool) -> Nav {
+fn nav_decision_for_browse(
+    id: WebViewId,
+    url: &str,
+    main_frame: bool,
+    user_gesture: bool,
+) -> NavDecision {
     let (nav_handler, external_links, initial_url) = with_webviews(|w| {
         let rec = w.get(&id);
         (
@@ -993,18 +998,18 @@ fn nav_decision_for_browse(id: WebViewId, url: &str, main_frame: bool, user_gest
         if let Ok(mut g) = handler.lock() {
             g(&req)
         } else {
-            Nav::Allow
+            NavDecision::Allow
         }
     } else if external_links && user_gesture && main_frame {
         let req = NavRequest::new(url, main_frame);
         let init_req = NavRequest::new(&initial_url, true);
         if matches!(req.scheme(), Some("http" | "https")) && req.host() != init_req.host() {
-            Nav::External
+            NavDecision::OpenInBrowser
         } else {
-            Nav::Allow
+            NavDecision::Allow
         }
     } else {
-        Nav::Allow
+        NavDecision::Allow
     }
 }
 
@@ -1124,7 +1129,7 @@ unsafe extern "C" fn life_on_before_popup(
         // SAFETY: `target_url` is a valid CEF string pointer passed synchronously.
         let url = unsafe { api.from_cef_string(target_url) };
         match nav_decision_for_popup(data.wv_id, &url) {
-            Nav::Allow => {
+            NavDecision::Allow => {
                 if is_valid_browser(browser) {
                     // SAFETY: Navigate single-page view in place.
                     unsafe {
@@ -1142,10 +1147,10 @@ unsafe extern "C" fn life_on_before_popup(
                     }
                 }
             }
-            Nav::External => {
+            NavDecision::OpenInBrowser => {
                 open_external_url(&url);
             }
-            Nav::Cancel => {}
+            NavDecision::Block => {}
         }
     }
     // SAFETY: Release incoming CEF references. Always cancel separate popup window creation (`1`).
@@ -1478,9 +1483,9 @@ unsafe extern "C" fn req_on_before_browse(
         // SAFETY: `frame` is non-null inside callback.
         let main_frame = unsafe { (*frame).is_main.map(|f| f(frame) != 0).unwrap_or(true) };
         match nav_decision_for_browse(data.wv_id, &url, main_frame, user_gesture != 0) {
-            Nav::Allow => {}
-            Nav::Cancel => cancel = 1,
-            Nav::External => {
+            NavDecision::Allow => {}
+            NavDecision::Block => cancel = 1,
+            NavDecision::OpenInBrowser => {
                 open_external_url(&url);
                 cancel = 1;
             }
@@ -2260,6 +2265,63 @@ pub(crate) fn go_forward(id: WebViewId) {
                 && let Some(gf) = (*browser).go_forward
             {
                 gf(browser);
+            }
+        }
+    });
+}
+
+/// Finds `text` in the page. CEF reports matches through a separate handler
+/// that `ui` doesn't wire up, so `f` gets `None`.
+pub(crate) fn find(
+    id: WebViewId,
+    text: &str,
+    case_sensitive: bool,
+    backwards: bool,
+    f: Box<dyn FnOnce(Option<bool>) + Send>,
+) {
+    with_browser(id, |api, _, host| {
+        if host.is_null() {
+            return;
+        }
+        // SAFETY: `host` is valid and retained by `with_browser`.
+        unsafe {
+            if let Some(find) = (*host).find {
+                let mut t = api.cef_string(text);
+                find(
+                    host,
+                    &t,
+                    c_int::from(!backwards),
+                    c_int::from(case_sensitive),
+                    1,
+                );
+                api.clear_cef_string(&mut t);
+            }
+        }
+    });
+    f(None);
+}
+
+pub(crate) fn clear_find(id: WebViewId) {
+    with_browser(id, |_, _, host| {
+        // SAFETY: `host` is valid and retained by `with_browser`.
+        unsafe {
+            if !host.is_null()
+                && let Some(stop) = (*host).stop_finding
+            {
+                stop(host, 1);
+            }
+        }
+    });
+}
+
+pub(crate) fn print(id: WebViewId) {
+    with_browser(id, |_, _, host| {
+        // SAFETY: `host` is valid and retained by `with_browser`.
+        unsafe {
+            if !host.is_null()
+                && let Some(p) = (*host).print
+            {
+                p(host);
             }
         }
     });

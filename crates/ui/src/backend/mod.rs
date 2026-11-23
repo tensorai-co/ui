@@ -4,6 +4,8 @@
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_appkit;
 #[cfg(target_os = "macos")]
+pub(crate) mod macos_notify;
+#[cfg(target_os = "macos")]
 pub(crate) mod macos_objc;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_webkit;
@@ -23,16 +25,16 @@ use crate::call::{CallState, STREAM_OPEN_PREFIX};
 use crate::dialog::{FileDialogKind, FileDialogSpec, MessageDialogSpec, MessageResult};
 use crate::event::{Event, WebViewEvent, WindowEvent};
 use crate::ipc::{
-    CallSpec, ClientSendPacket, Value, decode_base64, decode_rpc_request, decode_send_packet, encode_base64,
-    encode_event_batch, encode_event_frame, encode_rpc_response, parse,
+    CallSpec, ClientSendPacket, Value, decode_base64, decode_rpc_request, decode_send_packet,
+    encode_base64, encode_event_batch, encode_event_frame, encode_rpc_response, parse,
 };
 use crate::menu::{ContextMenuItem, Menu, MenuItemUpdate, Role};
 use crate::platform::{RawWebViewHandle, RawWindowHandle};
 use crate::webview::{
-    Ctx, EventHandler, LoadState, Response, RpcHandler, RpcKind, RpcOutcome, WebView, WebViewEventHandler, WebViewId,
-    WebViewSpec,
+    Context, EventHandler, LoadState, Response, RpcHandler, RpcKind, RpcOutcome, WebView,
+    WebViewEventHandler, WebViewId, WebViewSpec,
 };
-use crate::window::{Bounds, Display, Theme, Window, WindowId, WindowSpec, WindowState};
+use crate::window::{Bounds, Monitor, Theme, Window, WindowId, WindowSpec, WindowState};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,6 +324,17 @@ struct WebViewDispatchRecord {
     on_event: Option<WebViewEventHandler>,
     /// Last page zoom set through `set_zoom` or the View menu.
     zoom: f64,
+    /// User-defaults key the zoom is remembered under (persistent profiles only).
+    zoom_key: Option<String>,
+}
+
+/// Where a profile's page zoom is remembered; ephemeral profiles forget it.
+pub(crate) fn zoom_key(profile: &crate::webview::Profile) -> Option<String> {
+    match profile {
+        crate::webview::Profile::Default => Some("ui.zoom.default".into()),
+        crate::webview::Profile::Persistent(name) => Some(format!("ui.zoom.profile.{name}")),
+        crate::webview::Profile::Ephemeral => None,
+    }
 }
 
 /// Page zoom steps for the View menu's Zoom In / Zoom Out, as browsers use.
@@ -428,7 +441,10 @@ impl Runtime {
         self.wake();
     }
 
-    pub(crate) fn call_main_sync<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> T {
+    pub(crate) fn call_main_sync<T: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
         if self.is_main() {
             return f();
         }
@@ -469,6 +485,49 @@ impl Runtime {
             #[cfg(target_os = "macos")]
             macos_appkit::request_quit();
         }));
+    }
+
+    pub fn show_notification(self: &Arc<Self>, n: crate::app::Notification) -> String {
+        self.call_main_sync(move || {
+            #[cfg(target_os = "macos")]
+            {
+                macos_notify::show(n.id, &n.title, n.subtitle.as_deref(), &n.body, n.sound)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                n.id.unwrap_or_default()
+            }
+        })
+    }
+
+    pub fn remove_notification(self: &Arc<Self>, id: String) {
+        self.call_main_sync(move || {
+            #[cfg(target_os = "macos")]
+            macos_notify::remove(&id);
+            #[cfg(not(target_os = "macos"))]
+            let _ = id;
+        });
+    }
+
+    pub fn notification_permission(
+        self: &Arc<Self>,
+        f: Box<dyn FnOnce(crate::app::NotificationPermission) + Send>,
+    ) {
+        self.call_main_sync(move || {
+            #[cfg(target_os = "macos")]
+            macos_notify::permission(f);
+            #[cfg(not(target_os = "macos"))]
+            f(crate::app::NotificationPermission::Unbundled);
+        });
+    }
+
+    pub fn request_notification_permission(self: &Arc<Self>, f: Box<dyn FnOnce(bool) + Send>) {
+        self.call_main_sync(move || {
+            #[cfg(target_os = "macos")]
+            macos_notify::request_permission(f);
+            #[cfg(not(target_os = "macos"))]
+            f(false);
+        });
     }
 
     pub fn notify(&self, title: String, body: String) {
@@ -567,7 +626,7 @@ impl Runtime {
         })
     }
 
-    pub fn displays(self: &Arc<Self>) -> Vec<Display> {
+    pub fn displays(self: &Arc<Self>) -> Vec<Monitor> {
         self.call_main_sync(|| {
             #[cfg(target_os = "macos")]
             {
@@ -637,8 +696,12 @@ impl Runtime {
         let urls: Vec<String> = args
             .iter()
             .filter(|a| {
-                a.split_once("://")
-                    .is_some_and(|(scheme, _)| !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)))
+                a.split_once("://").is_some_and(|(scheme, _)| {
+                    !scheme.is_empty()
+                        && scheme
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+                })
             })
             .cloned()
             .collect();
@@ -1065,6 +1128,7 @@ impl Runtime {
                     msg_handlers: spec.msg_handlers.clone(),
                     on_event: spec.on_event.clone(),
                     zoom: 1.0,
+                    zoom_key: zoom_key(&spec.profile),
                 },
             );
         }
@@ -1080,6 +1144,22 @@ impl Runtime {
                 g.remove(&id);
             }
             return Err(err);
+        }
+
+        // Restore the page zoom this profile last used.
+        #[cfg(target_os = "macos")]
+        {
+            let key = self
+                .webviews
+                .lock()
+                .ok()
+                .and_then(|g| g.get(&id).and_then(|r| r.zoom_key.clone()));
+            if let Some(zoom) = key.and_then(|k| macos_appkit::defaults_f64(&k))
+                && zoom > 0.0
+                && (zoom - 1.0).abs() > 1e-3
+            {
+                self.webview_set_zoom(id, zoom);
+            }
         }
 
         Ok(WebView {
@@ -1176,11 +1256,24 @@ impl Runtime {
     }
 
     pub fn webview_set_zoom(self: &Arc<Self>, id: WebViewId, zoom: f64) {
+        let mut key = None;
         if let Ok(mut g) = self.webviews.lock()
             && let Some(rec) = g.get_mut(&id)
         {
             rec.zoom = zoom;
+            key = rec.zoom_key.clone();
         }
+        #[cfg(target_os = "macos")]
+        if let Some(key) = key {
+            let save = move || macos_appkit::set_defaults_f64(&key, zoom);
+            if self.is_main() {
+                save();
+            } else {
+                self.dispatch_on_main(Box::new(save));
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = key;
         let engine = self.engine;
         let f = move || match engine {
             #[cfg(target_os = "macos")]
@@ -1384,12 +1477,12 @@ impl Runtime {
         })
     }
 
-    fn make_ctx(self: &Arc<Self>, win_id: WindowId, id: WebViewId) -> Ctx {
+    fn make_ctx(self: &Arc<Self>, win_id: WindowId, id: WebViewId) -> Context {
         let win = Window {
             id: win_id,
             runtime: self.clone(),
         };
-        Ctx {
+        Context {
             window: win.clone(),
             webview: WebView {
                 id,
@@ -1574,7 +1667,9 @@ impl Runtime {
                 Some(other) => {
                     return reply(
                         responder,
-                        Err(format!("unknown theme \"{other}\"; use light, dark or system")),
+                        Err(format!(
+                            "unknown theme \"{other}\"; use light, dark or system"
+                        )),
                     );
                 }
             };
@@ -1589,13 +1684,17 @@ impl Runtime {
             (RpcKind::Stream, false) => {
                 return reply(
                     responder,
-                    Err(format!("\"{method}\" is a stream; open it with ipc.stream()")),
+                    Err(format!(
+                        "\"{method}\" is a stream; open it with ipc.stream()"
+                    )),
                 );
             }
             (RpcKind::Main | RpcKind::Blocking, true) => {
                 return reply(
                     responder,
-                    Err(format!("\"{method}\" is not a stream; call it with ipc.invoke()")),
+                    Err(format!(
+                        "\"{method}\" is not a stream; call it with ipc.invoke()"
+                    )),
                 );
             }
             _ => {}
@@ -1656,12 +1755,23 @@ impl Runtime {
         if let Err(err) = spawned
             && let Some((responder, _)) = slot.lock().unwrap_or_else(|e| e.into_inner()).take()
         {
-            finish(responder, Err(format!("could not start worker thread: {err}")));
+            finish(
+                responder,
+                Err(format!("could not start worker thread: {err}")),
+            );
         }
     }
 
     #[cfg(target_os = "macos")]
     pub(crate) fn handle_wk_fallback_message(self: &Arc<Self>, id: WebViewId, raw: &str) {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if cfg!(debug_assertions) && !WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "ui: IPC on this https:// page uses the WebKit message-handler fallback \
+                 (base64 frames, ~33% larger and slower). Serve local pages with \
+                 `assets(..)` / `bundle(..)` for binary IPC."
+            );
+        }
         let Ok(val) = parse(raw) else {
             return;
         };
@@ -1696,7 +1806,95 @@ impl Runtime {
         }
     }
 
+    pub fn webview_find(
+        self: &Arc<Self>,
+        id: WebViewId,
+        text: String,
+        opts: crate::webview::FindOptions,
+        f: Box<dyn FnOnce(Option<bool>) + Send>,
+    ) {
+        let engine = self.engine;
+        let run = move || match engine {
+            #[cfg(target_os = "macos")]
+            EngineKind::WebKit => macos_webkit::find(
+                id,
+                &text,
+                opts.case_sensitive,
+                opts.backwards,
+                opts.wraps,
+                f,
+            ),
+            #[cfg(feature = "cef")]
+            EngineKind::Cef => cef::find(id, &text, opts.case_sensitive, opts.backwards, f),
+        };
+        if self.is_main() {
+            run();
+        } else {
+            self.dispatch_on_main(Box::new(run));
+        }
+    }
+
+    pub fn webview_clear_find(self: &Arc<Self>, id: WebViewId) {
+        let engine = self.engine;
+        self.call_main_sync(move || match engine {
+            #[cfg(target_os = "macos")]
+            EngineKind::WebKit => macos_webkit::clear_find(id),
+            #[cfg(feature = "cef")]
+            EngineKind::Cef => cef::clear_find(id),
+        });
+    }
+
+    pub fn webview_print(self: &Arc<Self>, id: WebViewId) {
+        let engine = self.engine;
+        let run = move || match engine {
+            #[cfg(target_os = "macos")]
+            EngineKind::WebKit => macos_webkit::print(id),
+            #[cfg(feature = "cef")]
+            EngineKind::Cef => cef::print(id),
+        };
+        if self.is_main() {
+            run();
+        } else {
+            self.dispatch_on_main(Box::new(run));
+        }
+    }
+
+    pub fn webview_pdf(
+        self: &Arc<Self>,
+        id: WebViewId,
+        f: Box<dyn FnOnce(Option<Vec<u8>>) + Send>,
+    ) {
+        let engine = self.engine;
+        let run = move || match engine {
+            #[cfg(target_os = "macos")]
+            EngineKind::WebKit => macos_webkit::pdf(id, f),
+            #[cfg(feature = "cef")]
+            EngineKind::Cef => f(None),
+        };
+        if self.is_main() {
+            run();
+        } else {
+            self.dispatch_on_main(Box::new(run));
+        }
+    }
+
     pub(crate) fn handle_webview_event(self: &Arc<Self>, id: WebViewId, ev: WebViewEvent) {
+        if let WebViewEvent::FileDrop { paths, x, y } = &ev {
+            let payload = Value::Object(BTreeMap::from([
+                (
+                    "paths".to_owned(),
+                    Value::Array(
+                        paths
+                            .iter()
+                            .map(|p| Value::String(p.to_string_lossy().into_owned()))
+                            .collect(),
+                    ),
+                ),
+                ("x".to_owned(), Value::Float(*x)),
+                ("y".to_owned(), Value::Float(*y)),
+            ]));
+            self.webview_emit(id, "ui:file-drop".to_owned(), payload);
+        }
         let handler = self
             .webviews
             .lock()
@@ -1801,6 +1999,20 @@ where
                             | WindowEvent::ThemeChanged(_),
                         ) => runtime.push_chrome(*win_id),
                         Event::OpenUrl(_) | Event::OpenFiles(_) => runtime.deliver_opened(&ev),
+                        Event::NotificationClicked(id) => {
+                            let ids: Vec<WebViewId> = runtime
+                                .webviews
+                                .lock()
+                                .map(|g| g.keys().copied().collect())
+                                .unwrap_or_default();
+                            for wv in ids {
+                                runtime.webview_emit(
+                                    wv,
+                                    "ui:notification:click".to_owned(),
+                                    Value::String(id.clone()),
+                                );
+                            }
+                        }
                         _ => {}
                     }
                     runtime.emit_app_event(ev);
@@ -1865,10 +2077,22 @@ mod tests {
         use super::macos_appkit::{TitlebarAction, titlebar_action_for};
         assert_eq!(titlebar_action_for(None, false), TitlebarAction::Zoom);
         assert_eq!(titlebar_action_for(None, true), TitlebarAction::Minimize);
-        assert_eq!(titlebar_action_for(Some("Maximize"), true), TitlebarAction::Zoom);
-        assert_eq!(titlebar_action_for(Some("Fill"), false), TitlebarAction::Zoom);
-        assert_eq!(titlebar_action_for(Some("Minimize"), false), TitlebarAction::Minimize);
-        assert_eq!(titlebar_action_for(Some("None"), false), TitlebarAction::None);
+        assert_eq!(
+            titlebar_action_for(Some("Maximize"), true),
+            TitlebarAction::Zoom
+        );
+        assert_eq!(
+            titlebar_action_for(Some("Fill"), false),
+            TitlebarAction::Zoom
+        );
+        assert_eq!(
+            titlebar_action_for(Some("Minimize"), false),
+            TitlebarAction::Minimize
+        );
+        assert_eq!(
+            titlebar_action_for(Some("None"), false),
+            TitlebarAction::None
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1876,8 +2100,14 @@ mod tests {
     fn role_titles_include_the_app_name() {
         use super::macos_appkit::role_title_with_app;
         use crate::menu::Role;
-        assert_eq!(role_title_with_app(Role::Quit, "Quit", "Notes").as_deref(), Some("Quit Notes"));
-        assert_eq!(role_title_with_app(Role::Help, "Help", "Notes").as_deref(), Some("Notes Help"));
+        assert_eq!(
+            role_title_with_app(Role::Quit, "Quit", "Notes").as_deref(),
+            Some("Quit Notes")
+        );
+        assert_eq!(
+            role_title_with_app(Role::Help, "Help", "Notes").as_deref(),
+            Some("Notes Help")
+        );
         // Custom titles are left alone.
         assert_eq!(role_title_with_app(Role::Quit, "Exit", "Notes"), None);
         assert_eq!(role_title_with_app(Role::Copy, "Copy", "Notes"), None);

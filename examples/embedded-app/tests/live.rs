@@ -58,7 +58,10 @@ fn main() {
         let mount = |title: &str, reports: Arc<Mutex<Vec<Report>>>| -> ui::Result<()> {
             let win = Window::new(title).size(480, 320).open(app)?;
             WebView::new()
-                .bundle("app", ui::embedded!().spa("index.html").immutable("assets/"))
+                .bundle(
+                    "app",
+                    ui::embedded!().spa("index.html").immutable("assets/"),
+                )
                 .invoke("echo", |_ctx, s: String| format!("echo:{s}"))
                 .on("report", move |ctx, r: Report| {
                     reports.lock().unwrap().push(r);
@@ -92,17 +95,30 @@ fn main() {
     got.sort_by(|a, b| a.href.cmp(&b.href));
     eprintln!("[embedded-app] reports: {got:#?}");
     assert_eq!(got.len(), 2, "both pages must report");
-    let embedded = got.iter().find(|r| r.href.starts_with("app://")).expect("embedded page");
-    assert_eq!(embedded.href, "app://localhost/", "the URL stays / for routers");
+    let embedded = got
+        .iter()
+        .find(|r| r.href.starts_with("app://"))
+        .expect("embedded page");
+    assert_eq!(
+        embedded.href, "app://localhost/",
+        "the URL stays / for routers"
+    );
     assert_eq!(embedded.echo, "echo:embedded");
     assert_eq!(embedded.route_status, Some(200));
-    assert_eq!(embedded.route_is_index, Some(true), "SPA routes serve index.html");
+    assert_eq!(
+        embedded.route_is_index,
+        Some(true),
+        "SPA routes serve index.html"
+    );
     assert_eq!(embedded.missing_status, Some(404));
     assert_eq!(
         embedded.asset_cache.as_deref(),
         Some("public, max-age=31536000, immutable")
     );
-    let dev = got.iter().find(|r| r.href.starts_with("http://")).expect("dev page");
+    let dev = got
+        .iter()
+        .find(|r| r.href.starts_with("http://"))
+        .expect("dev page");
     assert_eq!(dev.href, format!("http://127.0.0.1:{port}/"));
     assert_eq!(dev.echo, "echo:dev", "IPC must work on the dev server page");
     eprintln!("[embedded-app] ALL CHECKS PASSED");

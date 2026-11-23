@@ -18,12 +18,16 @@ pub mod window;
 mod backend;
 mod js_shim;
 
-pub use app::{App, AppInfo, SingleInstance, run};
+pub use app::{App, AppInfo, Notification, NotificationPermission, SingleInstance, run};
 pub use call::Stream;
 pub use dialog::Dialog;
 pub use error::{Error, Result};
 pub use ipc::{Bytes, DecodeError, FromIpc, IntoIpc, RpcResult, Value};
 pub use menu::Menu;
 pub use standard::StandardRpcs;
-pub use webview::{Ctx, Nav, NavRequest, Profile, Request, Response, WebView};
-pub use window::{Backdrop, Tabbing, TitleBar, Window};
+pub use webview::{
+    Context, FindOptions, NavDecision, NavRequest, Profile, Request, Response, WebView,
+};
+#[allow(deprecated)]
+pub use webview::{Ctx, Nav};
+pub use window::{Backdrop, Monitor, Tabbing, TitleBar, Window, WindowControls};

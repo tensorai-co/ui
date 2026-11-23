@@ -25,6 +25,7 @@ fn main() {
         page_edited: bool,
         second_instance: Option<Vec<String>>,
         second_acquire_was_none: bool,
+        zoom_restored: Option<f64>,
     }
     let probe = Arc::new(Mutex::new(Probe::default()));
     let out = probe.clone();
@@ -44,10 +45,24 @@ fn main() {
         let second = ui::SingleInstance::acquire("ui-test-single-instance").expect("lock");
         probe.lock().unwrap().second_acquire_was_none = second.is_none();
 
+        // Page zoom is remembered per profile.
+        {
+            let zw = Window::new("zoom").size(300, 200).open(app)?;
+            let profile = ui::Profile::persistent("ui-test-zoom");
+            let a = WebView::html("<p>a</p>")
+                .profile(profile.clone())
+                .mount(&zw)?;
+            a.set_zoom(1.25);
+            let b = WebView::html("<p>b</p>").profile(profile).mount(&zw)?;
+            probe.lock().unwrap().zoom_restored = Some(b.zoom());
+            b.set_zoom(1.0); // leave the test profile at 100%
+            zw.close();
+        }
+
         // 1. Options at open time, then toggled at runtime.
         let win = Window::new("macos-options")
             .size(400, 300)
-            .title_bar(TitleBar::inset(52))
+            .title_bar(TitleBar::overlay(52))
             .restore_state(NAME)
             .macos(|m| {
                 m.titlebar_separator(false)
@@ -100,7 +115,7 @@ fn main() {
             app2.dispatch(move |app| {
                 let again = Window::new("macos-restored")
                     .size(400, 300)
-                    .title_bar(TitleBar::inset(52))
+                    .title_bar(TitleBar::overlay(52))
                     .macos(|m| m.toolbar_style(ui::macos::ToolbarStyle::Unified))
                     .restore_state(NAME)
                     .open(app)
@@ -124,20 +139,42 @@ fn main() {
 
     let g = out.lock().unwrap();
     eprintln!("[macos-window] {g:?}");
-    assert!(g.second_acquire_was_none, "a second acquire must not become primary");
+    assert_eq!(
+        g.zoom_restored,
+        Some(1.25),
+        "zoom restored for the same profile"
+    );
+    assert!(
+        g.second_acquire_was_none,
+        "a second acquire must not become primary"
+    );
     assert_eq!(
         g.second_instance,
         Some(std::env::args().skip(1).collect::<Vec<_>>()),
         "the second launch's arguments reach the primary"
     );
-    assert_eq!(g.level, (Some(WindowLevel::Floating), Some(WindowLevel::Normal)));
+    assert_eq!(
+        g.level,
+        (Some(WindowLevel::Floating), Some(WindowLevel::Normal))
+    );
     assert_eq!(g.edited, (true, false));
     assert!(g.page_edited, "ui:window.setDocumentEdited from the page");
     let h = g.chrome_titlebar.expect("page reported chrome");
-    assert!((40.0..80.0).contains(&h), "Unified toolbar title bar height, got {h}");
+    assert!(
+        (40.0..80.0).contains(&h),
+        "Unified toolbar title bar height, got {h}"
+    );
     let (first, restored) = (g.first.expect("first"), g.restored.expect("restored"));
-    assert_eq!((restored.width, restored.height), (first.width, first.height), "size restored");
-    assert_eq!((restored.x, restored.y), (first.x, first.y), "position restored");
+    assert_eq!(
+        (restored.width, restored.height),
+        (first.width, first.height),
+        "size restored"
+    );
+    assert_eq!(
+        (restored.x, restored.y),
+        (first.x, first.y),
+        "position restored"
+    );
     eprintln!("[macos-window] ALL CHECKS PASSED");
 }
 

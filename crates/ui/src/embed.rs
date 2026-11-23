@@ -47,7 +47,8 @@ impl Embedded {
     /// Marks files under `prefix` (e.g. `"assets/"`) as content-hashed and cacheable forever.
     pub fn immutable(mut self, prefix: impl Into<String>) -> Self {
         let p = trim_slashes(&prefix.into()).to_owned();
-        self.immutable.push(if p.is_empty() { p } else { format!("{p}/") });
+        self.immutable
+            .push(if p.is_empty() { p } else { format!("{p}/") });
         self
     }
 
@@ -98,7 +99,9 @@ fn trim_slashes(s: &str) -> &str {
 }
 
 fn looks_like_file(path: &str) -> bool {
-    path.rsplit('/').next().is_some_and(|last| last.contains('.'))
+    path.rsplit('/')
+        .next()
+        .is_some_and(|last| last.contains('.'))
 }
 
 fn percent_decode(s: &str) -> String {
@@ -162,7 +165,10 @@ mod tests {
         let root = get(&e, "app://localhost/");
         assert_eq!(root.status, 200);
         assert_eq!(root.body, b"<html>home</html>".to_vec());
-        assert_eq!(root.headers.get("Cache-Control").map(String::as_str), Some("no-cache"));
+        assert_eq!(
+            root.headers.get("Cache-Control").map(String::as_str),
+            Some("no-cache")
+        );
 
         let js = get(&e, "app://localhost/assets/app-1a2b.js?v=1");
         assert_eq!(js.status, 200);
@@ -171,13 +177,21 @@ mod tests {
             js.headers.get("Cache-Control").map(String::as_str),
             Some("public, max-age=31536000, immutable")
         );
-        assert_eq!(get(&e, "app://localhost/docs/My%20File.txt").body, b"hi".to_vec());
+        assert_eq!(
+            get(&e, "app://localhost/docs/My%20File.txt").body,
+            b"hi".to_vec()
+        );
     }
 
     #[test]
     fn spa_fallback_only_for_routes() {
-        let e = Embedded::new(FILES).spa("/index.html/").immutable("/assets");
-        assert_eq!(get(&e, "app://localhost/settings/profile").body, b"<html>home</html>".to_vec());
+        let e = Embedded::new(FILES)
+            .spa("/index.html/")
+            .immutable("/assets");
+        assert_eq!(
+            get(&e, "app://localhost/settings/profile").body,
+            b"<html>home</html>".to_vec()
+        );
         // Missing files and anything under an asset folder stay 404.
         assert_eq!(get(&e, "app://localhost/missing.png").status, 404);
         assert_eq!(get(&e, "app://localhost/assets/gone").status, 404);

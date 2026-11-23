@@ -1,5 +1,5 @@
 //! Single-page webview surface (`WKWebView` on macOS default, Spotify CEF on `--features cef`/Win/Linux),
-//! custom URL scheme assets, typed IPC wiring, navigation policy, and callback `Ctx`.
+//! custom URL scheme assets, typed IPC wiring, navigation policy, and callback `Context`.
 
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
@@ -15,8 +15,49 @@ use crate::platform::RawWebViewHandle;
 use crate::window::Window;
 use crate::{Error, Result};
 
+const MIRROR_THEME_JS: &str = r#"(function() {
+  let last;
+  function sync() {
+    const root = document.documentElement;
+    if (!root || !window.ipc) return;
+    const t = root.getAttribute("data-theme");
+    const theme = t === "light" || t === "dark" ? t : "system";
+    if (theme === last) return;
+    last = theme;
+    window.ipc.window.setTheme(theme).catch(() => {});
+  }
+  function watch() {
+    sync();
+    new MutationObserver(sync).observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-theme"],
+    });
+  }
+  if (document.documentElement) watch();
+  else document.addEventListener("readystatechange", watch, { once: true });
+})();"#;
+
 /// Reserved custom URL scheme used by `ui` for binary IPC (`ui-ipc://ipc/...`).
 pub(crate) const IPC_SCHEME: &str = "ui-ipc";
+
+/// Options for [`WebView::find`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FindOptions {
+    pub case_sensitive: bool,
+    pub backwards: bool,
+    /// Continue from the start after the last match (default true).
+    pub wraps: bool,
+}
+
+impl Default for FindOptions {
+    fn default() -> Self {
+        Self {
+            case_sensitive: false,
+            backwards: false,
+            wraps: true,
+        }
+    }
+}
 
 /// Opaque unique webview identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -33,12 +74,25 @@ pub enum LoadState {
 
 /// Navigation/popup decision returned from `.on_navigate` or `.on_popup`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Nav {
+pub enum NavDecision {
     #[default]
     Allow,
-    Cancel,
-    /// Cancels in-webview navigation and opens the URL in the OS default browser.
-    External,
+    /// Stops the navigation.
+    Block,
+    /// Stops in-webview navigation and opens the URL in the default browser.
+    OpenInBrowser,
+}
+
+/// Renamed to [`NavDecision`].
+#[deprecated(since = "0.2.0", note = "renamed to `NavDecision`")]
+pub type Nav = NavDecision;
+
+#[allow(non_upper_case_globals)]
+impl NavDecision {
+    #[deprecated(since = "0.2.0", note = "renamed to `NavDecision::Block`")]
+    pub const Cancel: Self = Self::Block;
+    #[deprecated(since = "0.2.0", note = "renamed to `NavDecision::OpenInBrowser`")]
+    pub const External: Self = Self::OpenInBrowser;
 }
 
 /// WebView storage and cache profile.
@@ -292,9 +346,9 @@ impl Response {
     }
 }
 
-/// Context passed to every `.invoke`, `.on`, `.on_msg`, and lifecycle handler.
+/// Context passed to every `.invoke`, `.on`, `.on_command`, and lifecycle handler.
 #[derive(Clone)]
-pub struct Ctx {
+pub struct Context {
     pub(crate) window: Window,
     pub(crate) webview: WebView,
     pub(crate) app: App,
@@ -302,7 +356,11 @@ pub struct Ctx {
     pub(crate) call: Option<(u32, Arc<CallState>)>,
 }
 
-impl Ctx {
+/// Renamed to [`Context`].
+#[deprecated(since = "0.2.0", note = "renamed to `Context`")]
+pub type Ctx = Context;
+
+impl Context {
     pub fn window(&self) -> Window {
         self.window.clone()
     }
@@ -342,7 +400,11 @@ pub(crate) fn dev_url_from(value: Option<&str>) -> Option<String> {
     let host = if let Some(v6) = authority.strip_prefix('[') {
         v6.split(']').next().map(|h| format!("[{h}]"))?
     } else {
-        authority.split(':').next().unwrap_or("").to_ascii_lowercase()
+        authority
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
     };
     matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]").then(|| url.to_owned())
 }
@@ -366,7 +428,7 @@ pub(crate) enum RpcOutcome {
     Worker(Box<dyn FnOnce() -> std::result::Result<Value, String> + Send>),
 }
 
-type RpcFn = Box<dyn FnMut(Ctx, Value) -> RpcOutcome + Send>;
+type RpcFn = Box<dyn FnMut(Context, Value) -> RpcOutcome + Send>;
 
 pub(crate) struct RpcEntry {
     pub kind: RpcKind,
@@ -374,8 +436,8 @@ pub(crate) struct RpcEntry {
 }
 
 pub(crate) type RpcHandler = Arc<RpcEntry>;
-pub(crate) type EventHandler = Arc<Mutex<Box<dyn FnMut(Ctx, Value) + Send>>>;
-pub(crate) type NavHandler = Arc<Mutex<Box<dyn FnMut(&NavRequest) -> Nav + Send>>>;
+pub(crate) type EventHandler = Arc<Mutex<Box<dyn FnMut(Context, Value) + Send>>>;
+pub(crate) type NavHandler = Arc<Mutex<Box<dyn FnMut(&NavRequest) -> NavDecision + Send>>>;
 pub(crate) type WebViewEventHandler = Arc<Mutex<Box<dyn FnMut(WebViewEvent) + Send>>>;
 
 #[derive(Clone)]
@@ -476,7 +538,10 @@ impl WebViewBuilder {
     /// WebView::new().bundle("app", ui::embedded!().spa("index.html").immutable("assets/"))
     /// ```
     pub fn bundle(self, scheme: impl Into<String>, files: crate::embed::Embedded) -> Self {
-        self.scheme_handler(scheme.into(), Arc::new(move |req: &Request| files.serve(req)))
+        self.scheme_handler(
+            scheme.into(),
+            Arc::new(move |req: &Request| files.serve(req)),
+        )
     }
 
     fn scheme_handler(mut self, scheme: String, handler: AssetHandler) -> Self {
@@ -494,9 +559,15 @@ impl WebViewBuilder {
         self
     }
 
-    pub fn inspectable(mut self, inspectable: bool) -> Self {
-        self.spec.inspectable = inspectable;
+    /// Allows the web inspector / developer tools for this webview.
+    pub fn devtools(mut self, enabled: bool) -> Self {
+        self.spec.inspectable = enabled;
         self
+    }
+
+    #[deprecated(since = "0.2.0", note = "renamed to `devtools`")]
+    pub fn inspectable(self, inspectable: bool) -> Self {
+        self.devtools(inspectable)
     }
 
     pub fn transparent(mut self, transparent: bool) -> Self {
@@ -509,24 +580,50 @@ impl WebViewBuilder {
         self
     }
 
+    /// Keeps the native window's appearance in step with the page's own theme
+    /// setting: whenever `<html data-theme="light" | "dark">` changes, the window
+    /// follows (any other value, or no attribute, follows the system).
+    pub fn mirror_theme(self) -> Self {
+        self.init_script(MIRROR_THEME_JS)
+    }
+
     pub fn init_script(mut self, script: impl Into<String>) -> Self {
         self.spec.init_scripts.push(script.into());
         self
     }
 
-    pub fn external_links(mut self, enabled: bool) -> Self {
+    /// Opens links that leave the app's own pages in the default browser.
+    pub fn open_links_in_browser(mut self, enabled: bool) -> Self {
         self.spec.external_links = enabled;
         self
     }
 
-    pub fn on_navigate(mut self, f: impl FnMut(&NavRequest) -> Nav + Send + 'static) -> Self {
+    #[deprecated(since = "0.2.0", note = "renamed to `open_links_in_browser`")]
+    pub fn external_links(self, enabled: bool) -> Self {
+        self.open_links_in_browser(enabled)
+    }
+
+    pub fn on_navigate(
+        mut self,
+        f: impl FnMut(&NavRequest) -> NavDecision + Send + 'static,
+    ) -> Self {
         self.spec.on_navigate = Some(Arc::new(Mutex::new(Box::new(f))));
         self
     }
 
-    pub fn on_popup(mut self, f: impl FnMut(&NavRequest) -> Nav + Send + 'static) -> Self {
+    /// Decides what happens to requests for a new window (`target="_blank"`,
+    /// `window.open`).
+    pub fn on_new_window(
+        mut self,
+        f: impl FnMut(&NavRequest) -> NavDecision + Send + 'static,
+    ) -> Self {
         self.spec.on_popup = Some(Arc::new(Mutex::new(Box::new(f))));
         self
+    }
+
+    #[deprecated(since = "0.2.0", note = "renamed to `on_new_window`")]
+    pub fn on_popup(self, f: impl FnMut(&NavRequest) -> NavDecision + Send + 'static) -> Self {
+        self.on_new_window(f)
     }
 
     pub fn on_event(mut self, f: impl FnMut(WebViewEvent) + Send + 'static) -> Self {
@@ -572,7 +669,7 @@ impl WebViewBuilder {
     where
         A: FromIpc,
         R: RpcResult,
-        F: FnMut(Ctx, A) -> R + Send + 'static,
+        F: FnMut(Context, A) -> R + Send + 'static,
     {
         let func: RpcFn = Box::new(move |ctx, val| {
             RpcOutcome::Ready(
@@ -585,12 +682,12 @@ impl WebViewBuilder {
         self
     }
 
-    /// Same as [`invoke`](Self::invoke); kept under its v1 name.
+    #[deprecated(since = "0.2.0", note = "renamed to `invoke`, matching `ipc.invoke`")]
     pub fn rpc<A, R, F>(self, name: impl Into<String>, handler: F) -> Self
     where
         A: FromIpc,
         R: RpcResult,
-        F: FnMut(Ctx, A) -> R + Send + 'static,
+        F: FnMut(Context, A) -> R + Send + 'static,
     {
         self.invoke(name, handler)
     }
@@ -601,7 +698,7 @@ impl WebViewBuilder {
     /// Use it for anything slow (builds, scans, network). Calls run concurrently,
     /// each on its own thread, so the handler is `Fn + Sync`. The page can pass
     /// `{ signal, timeout }` as the last argument; check
-    /// [`Ctx::is_cancelled`] to stop early.
+    /// [`Context::is_cancelled`] to stop early.
     ///
     /// ```ignore
     /// .invoke_blocking("export_report", |ctx, req: ExportRequest| reports.export(&ctx, req))
@@ -610,7 +707,7 @@ impl WebViewBuilder {
     where
         A: FromIpc + Send + 'static,
         R: RpcResult,
-        F: Fn(Ctx, A) -> R + Send + Sync + 'static,
+        F: Fn(Context, A) -> R + Send + Sync + 'static,
     {
         let handler = Arc::new(handler);
         let func: RpcFn = Box::new(move |ctx, val| match A::from_ipc(&val) {
@@ -643,7 +740,7 @@ impl WebViewBuilder {
     where
         A: FromIpc + Send + 'static,
         R: RpcResult,
-        F: Fn(Ctx, A, Stream) -> R + Send + Sync + 'static,
+        F: Fn(Context, A, Stream) -> R + Send + Sync + 'static,
     {
         let handler = Arc::new(handler);
         let func: RpcFn = Box::new(move |ctx, val| {
@@ -699,7 +796,7 @@ impl WebViewBuilder {
     pub fn on<A, F>(mut self, event: impl Into<String>, mut handler: F) -> Self
     where
         A: FromIpc,
-        F: FnMut(Ctx, A) + Send + 'static,
+        F: FnMut(Context, A) + Send + 'static,
     {
         let boxed: EventHandler = Arc::new(Mutex::new(Box::new(move |ctx, val| {
             if let Ok(arg) = A::from_ipc(&val) {
@@ -711,7 +808,11 @@ impl WebViewBuilder {
     }
 
     /// Registers a strongly typed enum/message handler for `ipc.send({ type: "...", ... })`.
-    pub fn on_msg<T: FromIpc>(mut self, mut handler: impl FnMut(Ctx, T) + Send + 'static) -> Self {
+    /// Handles typed `ipc_enum!` commands sent with `ipc.emit({ type: "…", … })`.
+    pub fn on_command<T: FromIpc>(
+        mut self,
+        mut handler: impl FnMut(Context, T) + Send + 'static,
+    ) -> Self {
         let boxed: EventHandler = Arc::new(Mutex::new(Box::new(move |ctx, val| {
             if let Ok(msg) = T::from_ipc(&val) {
                 handler(ctx, msg);
@@ -719,6 +820,11 @@ impl WebViewBuilder {
         })));
         self.spec.msg_handlers.push(boxed);
         self
+    }
+
+    #[deprecated(since = "0.2.0", note = "renamed to `on_command`")]
+    pub fn on_msg<T: FromIpc>(self, handler: impl FnMut(Context, T) + Send + 'static) -> Self {
+        self.on_command(handler)
     }
 
     /// Mounts the webview filling the target window's content area and starts loading.
@@ -810,13 +916,48 @@ impl WebView {
         self.runtime.webview_set_zoom(self.id, zoom);
     }
 
+    /// Finds `text` in the page and selects the next match. `f` gets whether a
+    /// match was found (`None` when the engine doesn't say: CEF). Runs `f` on
+    /// a background thread.
+    pub fn find(
+        &self,
+        text: &str,
+        options: FindOptions,
+        f: impl FnOnce(Option<bool>) + Send + 'static,
+    ) {
+        self.runtime
+            .webview_find(self.id, text.to_owned(), options, Box::new(f));
+    }
+
+    /// Clears the current find match.
+    pub fn clear_find(&self) {
+        self.runtime.webview_clear_find(self.id);
+    }
+
+    /// Opens the system print panel for the page.
+    pub fn print(&self) {
+        self.runtime.webview_print(self.id);
+    }
+
+    /// Renders the page to PDF bytes (WebKit; `None` on CEF). Runs `f` on a
+    /// background thread.
+    pub fn pdf(&self, f: impl FnOnce(Option<Vec<u8>>) + Send + 'static) {
+        self.runtime.webview_pdf(self.id, Box::new(f));
+    }
+
     /// The page zoom last set with `set_zoom` or the View menu (1.0 = 100%).
+    /// Remembered per profile (not for `Profile::ephemeral()`) across launches.
     pub fn zoom(&self) -> f64 {
         self.runtime.webview_zoom(self.id)
     }
 
+    pub fn set_devtools(&self, enabled: bool) {
+        self.runtime.webview_set_inspectable(self.id, enabled);
+    }
+
+    #[deprecated(since = "0.2.0", note = "renamed to `set_devtools`")]
     pub fn set_inspectable(&self, inspectable: bool) {
-        self.runtime.webview_set_inspectable(self.id, inspectable);
+        self.set_devtools(inspectable);
     }
 
     pub fn open_devtools(&self) -> Result<()> {

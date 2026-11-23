@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use ui::ipc::{Bytes, FromIpc, IntoIpc, Value, parse};
 use ui::menu::{Menu, Role};
-use ui::webview::{LoadState, Mime, Nav, NavRequest, Profile, Request, Response};
-use ui::{Backdrop, TitleBar, WebView, Window, json};
+use ui::webview::{LoadState, Mime, NavDecision, NavRequest, Profile, Request, Response};
+use ui::{Backdrop, TitleBar, WebView, Window, WindowControls, json};
 
 ui::ipc_enum! {
     enum TestCmd {
@@ -43,6 +43,10 @@ ui::ipc_struct! {
         external_blocked: bool,
         clip_ok: bool,
         bad_menu_rejected: bool,
+        found: String,
+        not_found: String,
+        pdf_head: String,
+        mirror_ok: bool,
         missing: Option<String>,
     }
 }
@@ -117,14 +121,36 @@ fn check_pure_rust_contracts() {
     assert_eq!(asset.mime(), "text/javascript; charset=utf-8");
 
     // 5. Window/Menu value types
-    let tb = TitleBar::inset(38).traffic_lights(14, 12);
+    let tb = TitleBar::overlay(38).window_controls(WindowControls::at(14, 12));
     assert_eq!(
         tb,
-        TitleBar::Inset {
+        TitleBar::Overlay {
             height: 38,
-            traffic_lights: Some((14, 12))
+            window_controls: Some(WindowControls::at(14, 12))
         }
     );
+
+    // The v1 names still work, as deprecated aliases.
+    #[allow(deprecated)]
+    {
+        assert_eq!(TitleBar::inset(38).traffic_lights(14, 12), tb);
+        assert_eq!(TitleBar::Hidden, TitleBar::Frameless);
+        assert_eq!(ui::Backdrop::Transient, ui::Backdrop::Popover);
+        assert_eq!(ui::Backdrop::Mica, ui::Backdrop::Window);
+        assert_eq!(Role::Zoom, Role::Maximize);
+        assert_eq!(ui::event::Event::Reopen, ui::event::Event::Activate);
+        assert_eq!(ui::Nav::Cancel, NavDecision::Block);
+        assert_eq!(ui::Nav::External, NavDecision::OpenInBrowser);
+        assert_eq!(
+            ui::menu::Shortcut::cmd_shift("z"),
+            ui::menu::Shortcut::primary_shift("z")
+        );
+        let m: ui::menu::Mod = ui::menu::Modifiers::PRIMARY;
+        assert_eq!(m, ui::menu::Modifiers::PRIMARY);
+        fn takes_ctx(_: Option<ui::Ctx>) {}
+        takes_ctx(None::<ui::Context>);
+        let _: Option<ui::window::Display> = None::<ui::Monitor>;
+    }
 
     let std_menu = Menu::standard();
     assert!(std_menu.submenus.iter().any(|s| s.title == "Edit"));
@@ -166,7 +192,13 @@ struct LiveProbe {
 }
 
 /// A 2x2 PNG, for the Dock icon check.
-const TINY_PNG: &[u8] = &[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x72, 0xb6, 0x0d, 0x24, 0x00, 0x00, 0x00, 0x11, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x30, 0xab, 0xfe, 0xf0, 0x1f, 0x84, 0x19, 0x60, 0x0c, 0x00, 0x58, 0xf2, 0x0a, 0x81, 0x6c, 0xea, 0x49, 0xe2, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82];
+const TINY_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x72, 0xb6, 0x0d,
+    0x24, 0x00, 0x00, 0x00, 0x11, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x30, 0xab, 0xfe, 0xf0,
+    0x1f, 0x84, 0x19, 0x60, 0x0c, 0x00, 0x58, 0xf2, 0x0a, 0x81, 0x6c, 0xea, 0x49, 0xe2, 0x00, 0x00,
+    0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
 
 #[cfg(target_os = "macos")]
 fn check_dock(app: &ui::App) -> bool {
@@ -189,7 +221,9 @@ fn check_dock(app: &ui::App) -> bool {
     }
     let ok = shown.as_deref() == Some("3") && cleared.is_none() && icon_ok && junk_rejected;
     if !ok {
-        eprintln!("[conformance] dock: shown={shown:?} cleared={cleared:?} icon_ok={icon_ok} junk_rejected={junk_rejected}");
+        eprintln!(
+            "[conformance] dock: shown={shown:?} cleared={cleared:?} icon_ok={icon_ok} junk_rejected={junk_rejected}"
+        );
     }
     ok
 }
@@ -212,7 +246,7 @@ fn check_live_window_and_webview() {
         let win = Window::new("ui-conformance")
             .size(640, 420)
             .min_size(320, 240)
-            .title_bar(TitleBar::inset(38).traffic_lights(14, 12))
+            .title_bar(TitleBar::overlay(38).window_controls(WindowControls::at(14, 12)))
             .backdrop(Backdrop::Sidebar)
             .open(app)?;
 
@@ -335,6 +369,12 @@ async function boot() {
   await ipc.window.setTheme("dark");
   const darkOk = await waitFor(() => root.getAttribute("data-ui-theme") === "dark");
   await ipc.window.setTheme("system");
+  // .mirror_theme(): the window follows <html data-theme>.
+  root.setAttribute("data-theme", "dark");
+  const mirrorDark = await waitFor(() => root.getAttribute("data-ui-theme") === "dark");
+  root.setAttribute("data-theme", "light");
+  const mirrorLight = await waitFor(() => root.getAttribute("data-ui-theme") === "light");
+  root.removeAttribute("data-theme");
 
   let badMenu = await ipc.contextMenu([{ label: "No id" }], { x: 1, y: 1 }).then(
     () => false,
@@ -350,6 +390,17 @@ async function boot() {
   } catch (e) {
     externalBlocked = /only opens http/.test(e.message);
   }
+  const found = await ui.webview.find("Hello ui");
+  const notFound = await ui.webview.find("zz-not-on-this-page");
+  await ui.webview.clearFind();
+  let pdfHead = "";
+  try {
+    const pdf = await ui.webview.pdf();
+    pdfHead = new TextDecoder().decode(pdf.subarray(0, 5));
+  } catch (e) {
+    pdfHead = /isn't available/.test(e.message) ? "unsupported" : "error: " + e.message;
+  }
+
   // Clipboard round trip, only when it holds plain text we can put back.
   let clipOk = true;
   const original = await ui.clipboard.readText();
@@ -365,6 +416,8 @@ async function boot() {
     native: isNative(), client_platform: platform, info_version: info.version,
     info_backend: info.backend, info_named: info.name.length > 0, win_state: winState,
     external_blocked: externalBlocked, clip_ok: clipOk, bad_menu_rejected: badMenu,
+    found: found === null ? "null" : String(found), not_found: notFound === null ? "null" : String(notFound),
+    pdf_head: pdfHead, mirror_ok: mirrorDark && mirrorLight,
   });
 
   ipc.send("bin_upload", new Uint8Array([1, 2, 3, 4]));
@@ -374,7 +427,7 @@ boot();"#;
 
         let wv = WebView::new()
             .profile(Profile::ephemeral())
-            .inspectable(true)
+            .devtools(true)
             .assets("app", |req| match req.path() {
                 "/" | "/index.html" => Response::asset("index.html", HTML.as_bytes()),
                 "/entry.mjs" => Response::asset("entry.mjs", ENTRY_MJS.as_bytes()),
@@ -389,12 +442,12 @@ boot();"#;
                     g.nav_checked = true;
                 }
                 if req.host() == Some("blocked.invalid") {
-                    Nav::Cancel
+                    NavDecision::Block
                 } else {
-                    Nav::Allow
+                    NavDecision::Allow
                 }
             })
-            .rpc(
+            .invoke(
                 "slice_echo",
                 move |_ctx, (path, a, b): (String, usize, usize)| {
                     if let Ok(mut g) = p_rpc.lock() {
@@ -403,7 +456,7 @@ boot();"#;
                     format!("{path}:{a}:{b}")
                 },
             )
-            .rpc("bin_echo", move |_ctx, (tag, data): (String, Bytes)| {
+            .invoke("bin_echo", move |_ctx, (tag, data): (String, Bytes)| {
                 if let Ok(mut g) = p_bin_rpc.lock() {
                     g.bin_rpc_seen = Some((tag.clone(), data.0.clone()));
                 }
@@ -411,6 +464,7 @@ boot();"#;
                 (tag, Bytes(flipped))
             })
             .standard_rpcs(ui::StandardRpcs::all().version("9.9.9"))
+            .mirror_theme()
             .invoke_blocking("slow_add", move |_ctx, (a, b): (i64, i64)| {
                 std::thread::sleep(Duration::from_millis(30));
                 if let Ok(mut g) = p_blocking.lock() {
@@ -435,7 +489,9 @@ boot();"#;
                     total += i64::from(i);
                 }
                 if let Some(back) = stream.recv() {
-                    total += Bytes::from_ipc(&back).map(|b| i64::from(b.0[0])).unwrap_or(0);
+                    total += Bytes::from_ipc(&back)
+                        .map(|b| i64::from(b.0[0]))
+                        .unwrap_or(0);
                 }
                 Ok(stream.close_with(total))
             })
@@ -451,14 +507,11 @@ boot();"#;
                 }
                 "stopped"
             })
-            .on(
-                "v2_report",
-                move |_ctx, report: V2Report| {
-                    if let Ok(mut g) = p_v2.lock() {
-                        g.v2_report = Some(report);
-                    }
-                },
-            )
+            .on("v2_report", move |_ctx, report: V2Report| {
+                if let Ok(mut g) = p_v2.lock() {
+                    g.v2_report = Some(report);
+                }
+            })
             .on("bin_upload", move |_ctx, data: Bytes| {
                 if let Ok(mut g) = p_bin_up.lock() {
                     g.bin_upload_seen = Some(data.0);
@@ -472,7 +525,7 @@ boot();"#;
                 ctx.emit("host_ping", json!({ "msg": "pong-from-host" }));
                 ctx.emit("frame_emit", (4u32, Bytes(vec![0xaa, 0xbb, 0xcc, 0xdd])));
             })
-            .on_msg::<TestCmd>(move |ctx, cmd| {
+            .on_command::<TestCmd>(move |ctx, cmd| {
                 if let TestCmd::Rename { ref title } = cmd {
                     ctx.window().set_title(title);
                 }
@@ -510,7 +563,7 @@ boot();"#;
                 </script></body></html>"#;
                     WebView::html(INLINE)
                         .profile(Profile::ephemeral())
-                        .rpc("ping_bin", |_ctx, data: Bytes| data)
+                        .invoke("ping_bin", |_ctx, data: Bytes| data)
                         .on("done", move |ctx, data: Bytes| {
                             if let Ok(mut g) = inline_probe.lock() {
                                 g.inline_html_bytes = Some(data.0);
@@ -596,7 +649,11 @@ boot();"#;
         g.blocking_thread
     );
     assert!(g.cancel_seen, "a page timeout must set ctx.is_cancelled()");
-    assert_eq!(g.dock_ok, cfg!(target_os = "macos"), "Dock badge / icon checks");
+    assert_eq!(
+        g.dock_ok,
+        cfg!(target_os = "macos"),
+        "Dock badge / icon checks"
+    );
     assert!(g.stream_stopped, "stream.close() must close the Rust side");
     let mut report = g.v2_report.clone().expect("v2 report");
     assert!(
@@ -629,6 +686,26 @@ boot();"#;
             external_blocked: true,
             clip_ok: true,
             bad_menu_rejected: true,
+            // WebKit reports matches and renders PDFs; CEF does neither through `ui`.
+            found: if g.backend == "webkit" {
+                "true"
+            } else {
+                "null"
+            }
+            .into(),
+            not_found: if g.backend == "webkit" {
+                "false"
+            } else {
+                "null"
+            }
+            .into(),
+            pdf_head: if g.backend == "webkit" {
+                "%PDF-"
+            } else {
+                "unsupported"
+            }
+            .into(),
+            mirror_ok: true,
             missing: None,
         }),
         "invoke_blocking / timeout / stream results"
