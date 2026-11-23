@@ -100,6 +100,17 @@ fn render_plist_extras(meta: &AppMetadata) -> String {
         }
         out.push_str("  </array>\n");
     }
+    for (key, val) in [
+        ("NSMicrophoneUsageDescription", &meta.microphone_usage),
+        ("NSSpeechRecognitionUsageDescription", &meta.speech_usage),
+    ] {
+        if let Some(v) = val {
+            out.push_str(&format!(
+                "  <key>{key}</key>\n  <string>{}</string>\n",
+                xml_escape(v)
+            ));
+        }
+    }
     if let Some(icon) = meta.icon.as_deref().filter(|i| i.ends_with(".icns")) {
         let file = Path::new(icon)
             .file_name()

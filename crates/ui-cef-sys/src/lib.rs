@@ -596,6 +596,83 @@ pub struct cef_client_t {
 }
 
 #[repr(C)]
+pub struct cef_find_handler_t {
+    pub base: cef_base_ref_counted_t,
+    pub on_find_result: Option<
+        unsafe extern "C" fn(
+            *mut cef_find_handler_t,
+            *mut cef_browser_t,
+            c_int,
+            c_int,
+            *const c_void,
+            c_int,
+            c_int,
+        ),
+    >,
+}
+
+#[repr(C)]
+pub struct cef_drag_handler_t {
+    pub base: cef_base_ref_counted_t,
+    pub on_drag_enter: Option<
+        unsafe extern "C" fn(
+            *mut cef_drag_handler_t,
+            *mut cef_browser_t,
+            *mut cef_drag_data_t,
+            u32,
+        ) -> c_int,
+    >,
+    pub on_draggable_regions_changed: Option<
+        unsafe extern "C" fn(
+            *mut cef_drag_handler_t,
+            *mut cef_browser_t,
+            *mut cef_frame_t,
+            usize,
+            *const c_void,
+        ),
+    >,
+}
+
+type DragStr = Option<unsafe extern "C" fn(*mut cef_drag_data_t) -> cef_string_userfree_t>;
+type DragSet = Option<unsafe extern "C" fn(*mut cef_drag_data_t, *const cef_string_t)>;
+
+#[repr(C)]
+pub struct cef_drag_data_t {
+    pub base: cef_base_ref_counted_t,
+    pub clone: Option<unsafe extern "C" fn(*mut cef_drag_data_t) -> *mut cef_drag_data_t>,
+    pub is_read_only: Option<unsafe extern "C" fn(*mut cef_drag_data_t) -> c_int>,
+    pub is_link: Option<unsafe extern "C" fn(*mut cef_drag_data_t) -> c_int>,
+    pub is_fragment: Option<unsafe extern "C" fn(*mut cef_drag_data_t) -> c_int>,
+    pub is_file: Option<unsafe extern "C" fn(*mut cef_drag_data_t) -> c_int>,
+    pub get_link_url: DragStr,
+    pub get_link_title: DragStr,
+    pub get_link_metadata: DragStr,
+    pub get_fragment_text: DragStr,
+    pub get_fragment_html: DragStr,
+    pub get_fragment_base_url: DragStr,
+    pub get_file_name: DragStr,
+    pub get_file_contents: Option<unsafe extern "C" fn(*mut cef_drag_data_t, *mut c_void) -> usize>,
+    pub get_file_names:
+        Option<unsafe extern "C" fn(*mut cef_drag_data_t, cef_string_list_t) -> c_int>,
+    pub get_file_paths:
+        Option<unsafe extern "C" fn(*mut cef_drag_data_t, cef_string_list_t) -> c_int>,
+    pub set_link_url: DragSet,
+    pub set_link_title: DragSet,
+    pub set_link_metadata: DragSet,
+    pub set_fragment_text: DragSet,
+    pub set_fragment_html: DragSet,
+    pub set_fragment_base_url: DragSet,
+    pub reset_file_contents: Option<unsafe extern "C" fn(*mut cef_drag_data_t)>,
+    pub add_file: Option<
+        unsafe extern "C" fn(*mut cef_drag_data_t, *const cef_string_t, *const cef_string_t),
+    >,
+    pub clear_filenames: Option<unsafe extern "C" fn(*mut cef_drag_data_t)>,
+    pub get_image: Option<unsafe extern "C" fn(*mut cef_drag_data_t) -> *mut c_void>,
+    pub get_image_hotspot: Option<unsafe extern "C" fn(*mut cef_drag_data_t) -> cef_point_t>,
+    pub has_image: Option<unsafe extern "C" fn(*mut cef_drag_data_t) -> c_int>,
+}
+
+#[repr(C)]
 pub struct cef_life_span_handler_t {
     pub base: cef_base_ref_counted_t,
     pub on_before_popup: Option<
@@ -1707,6 +1784,11 @@ pub struct CefApi {
     pub cef_string_utf16_clear: unsafe extern "C" fn(*mut cef_string_utf16_t),
     pub cef_string_utf8_clear: unsafe extern "C" fn(*mut cef_string_utf8_t),
     pub cef_string_userfree_utf16_free: unsafe extern "C" fn(cef_string_userfree_t),
+    pub cef_string_list_alloc: unsafe extern "C" fn() -> cef_string_list_t,
+    pub cef_string_list_size: unsafe extern "C" fn(cef_string_list_t) -> usize,
+    pub cef_string_list_value:
+        unsafe extern "C" fn(cef_string_list_t, usize, *mut cef_string_t) -> c_int,
+    pub cef_string_list_free: unsafe extern "C" fn(cef_string_list_t),
     pub cef_string_multimap_alloc: unsafe extern "C" fn() -> cef_string_multimap_t,
     pub cef_string_multimap_size: unsafe extern "C" fn(cef_string_multimap_t) -> usize,
     pub cef_string_multimap_key:
@@ -1833,6 +1915,10 @@ impl CefApi {
                         lib,
                         c"cef_string_userfree_utf16_free",
                     )?,
+                    cef_string_list_alloc: resolve_sym(lib, c"cef_string_list_alloc")?,
+                    cef_string_list_size: resolve_sym(lib, c"cef_string_list_size")?,
+                    cef_string_list_value: resolve_sym(lib, c"cef_string_list_value")?,
+                    cef_string_list_free: resolve_sym(lib, c"cef_string_list_free")?,
                     cef_string_multimap_alloc: resolve_sym(lib, c"cef_string_multimap_alloc")?,
                     cef_string_multimap_size: resolve_sym(lib, c"cef_string_multimap_size")?,
                     cef_string_multimap_key: resolve_sym(lib, c"cef_string_multimap_key")?,
@@ -1903,6 +1989,29 @@ impl CefApi {
         // SAFETY: Caller guarantees `r.str` holds `r.length` initialized `u16` values.
         let units = unsafe { std::slice::from_raw_parts(r.str, r.length) };
         String::from_utf16_lossy(units)
+    }
+
+    /// Reads every entry of a `cef_string_list_t`.
+    ///
+    /// # Safety
+    /// `list` must be a live string list allocated by CEF.
+    pub unsafe fn string_list(&self, list: cef_string_list_t) -> Vec<String> {
+        // SAFETY: caller guarantees `list` is a live CEF string list.
+        let n = unsafe { (self.cef_string_list_size)(list) };
+        (0..n)
+            .map(|i| {
+                let mut s = cef_string_t::default();
+                // SAFETY: `i` is in range; CEF copies the entry into `s`.
+                unsafe {
+                    (self.cef_string_list_value)(list, i, &mut s);
+                    let text = self.from_cef_string(&s);
+                    if let Some(dtor) = s.dtor {
+                        dtor(s.str);
+                    }
+                    text
+                }
+            })
+            .collect()
     }
 
     /// Reads and frees a `cef_string_userfree_t` returned from CEF.

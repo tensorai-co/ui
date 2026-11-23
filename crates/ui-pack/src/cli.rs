@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use crate::linux::render_desktop_entry;
 use crate::macos::{MacChannel, MacPackOptions, pack_macos_app};
 use crate::metadata::AppMetadata;
-use crate::run::{RunOptions, make_icons, run};
+use crate::run::{RunOptions, gen_ts, make_icons, run};
 use crate::windows::render_appx_manifest;
 
 const USAGE: &str = "\
@@ -15,6 +15,9 @@ Usage:
   ui-pack msix | linux [--manifest Cargo.toml]
   ui-pack run [--manifest Cargo.toml] [--release] [--dev] [-- app args…]
   ui-pack icons <icon.png> [--out dir]
+  ui-pack gen-ts [--manifest Cargo.toml] [--out ipc.d.ts]
+  ui-pack update-key [--out dir]
+  ui-pack update-feed <private-key.pem> <version> <url> [notes] > feed.json
 
 `cargo ui <command>` runs the same commands (`cargo install` puts `cargo-ui` on PATH).";
 
@@ -99,7 +102,43 @@ pub fn main_with(args: Vec<String>) {
         return;
     }
 
+    if matches!(target, "update-key" | "update-feed") {
+        match target {
+            "update-key" => {
+                let dir = out_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+                match crate::update::make_key(&dir) {
+                    Ok((key, public)) => {
+                        println!(
+                            "Private key: {} (keep it secret; don't commit it)",
+                            key.display()
+                        );
+                        println!("Public key for ui::update::check:\n{public}");
+                    }
+                    Err(e) => fail(e),
+                }
+            }
+            "update-feed" => {
+                let [key, version, url] = [0, 1, 2].map(|i| positional.get(i).cloned());
+                let (Some(key), Some(version), Some(url)) = (key, version, url) else {
+                    fail("usage: ui-pack update-feed <private-key.pem> <version> <url> [notes]");
+                };
+                match crate::update::make_feed(
+                    &PathBuf::from(key),
+                    &version,
+                    &url,
+                    positional.get(3).map(String::as_str),
+                ) {
+                    Ok(feed) => print!("{feed}"),
+                    Err(e) => fail(e),
+                }
+            }
+            _ => unreachable!(),
+        }
+        return;
+    }
+
     let meta = AppMetadata::from_manifest(&manifest).unwrap_or_else(|e| fail(e));
+    let gen_out = out_dir.clone();
     let out_dir = out_dir.unwrap_or_else(|| PathBuf::from("target/pack"));
 
     match target {
@@ -138,6 +177,13 @@ pub fn main_with(args: Vec<String>) {
             )
             .unwrap_or_else(|e| fail(e));
             std::process::exit(code);
+        }
+        "gen-ts" => {
+            let out = gen_out.unwrap_or_else(|| meta.manifest_dir.join("ipc.d.ts"));
+            match gen_ts(&meta, &manifest, &out) {
+                Ok(path) => println!("Wrote {}", path.display()),
+                Err(e) => fail(e),
+            }
         }
         "msix" => {
             println!(

@@ -4,6 +4,8 @@
 
 use std::sync::Arc;
 
+pub mod speech;
+
 use crate::app::App;
 use crate::backend::Runtime;
 use crate::backend::macos_appkit as appkit;
@@ -11,6 +13,22 @@ use crate::menu::MenuItem;
 pub use crate::window::Tabbing;
 use crate::window::{Window, WindowBuilder, WindowId};
 use crate::{Error, Result};
+
+/// macOS-only menu roles, for [`MenuItem::role`](crate::menu::MenuItem::role).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Role {
+    /// "Hide <App>" (Cmd+H).
+    Hide,
+    /// "Hide Others" (Alt+Cmd+H).
+    HideOthers,
+    ShowAll,
+}
+
+impl From<Role> for crate::menu::Role {
+    fn from(role: Role) -> Self {
+        Self::MacOs(role)
+    }
+}
 
 /// Adds [`macos`](AppExt::macos) to [`App`].
 pub trait AppExt {

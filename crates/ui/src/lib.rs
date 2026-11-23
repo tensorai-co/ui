@@ -11,7 +11,11 @@ pub mod ipc;
 pub mod macos;
 pub mod menu;
 pub mod platform;
+#[cfg(feature = "serde")]
+mod serde_ipc;
 pub mod standard;
+pub mod ts;
+pub mod update;
 pub mod webview;
 pub mod window;
 
@@ -24,7 +28,10 @@ pub use dialog::Dialog;
 pub use error::{Error, Result};
 pub use ipc::{Bytes, DecodeError, FromIpc, IntoIpc, RpcResult, Value};
 pub use menu::Menu;
+#[cfg(feature = "serde")]
+pub use serde_ipc::Serde;
 pub use standard::StandardRpcs;
+pub use ts::{TsType, write_typescript_if_requested};
 pub use webview::{
     Context, FindOptions, NavDecision, NavRequest, Profile, Request, Response, WebView,
 };

@@ -1403,7 +1403,7 @@ pub(crate) fn set_clipboard_text(text: &str) {
 pub(crate) fn role_title_with_app(role: Role, title: &str, app: &str) -> Option<String> {
     match (role, title) {
         (Role::About, "About") => Some(format!("About {app}")),
-        (Role::Hide, "Hide") => Some(format!("Hide {app}")),
+        (Role::MacOs(crate::macos::Role::Hide), "Hide") => Some(format!("Hide {app}")),
         (Role::Quit, "Quit") => Some(format!("Quit {app}")),
         (Role::Help, "Help") => Some(format!("{app} Help")),
         _ => None,
@@ -1422,9 +1422,9 @@ fn next_menu_tag() -> isize {
 fn native_role_selector(role: Role) -> Option<&'static str> {
     Some(match role {
         Role::About => "orderFrontStandardAboutPanel:",
-        Role::Hide => "hide:",
-        Role::HideOthers => "hideOtherApplications:",
-        Role::ShowAll => "unhideAllApplications:",
+        Role::MacOs(crate::macos::Role::Hide) => "hide:",
+        Role::MacOs(crate::macos::Role::HideOthers) => "hideOtherApplications:",
+        Role::MacOs(crate::macos::Role::ShowAll) => "unhideAllApplications:",
         Role::Quit => "terminate:",
         Role::Undo => "undo:",
         Role::Redo => "redo:",

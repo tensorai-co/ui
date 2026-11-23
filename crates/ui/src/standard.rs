@@ -31,6 +31,7 @@ pub struct StandardRpcs {
     window: bool,
     notify: bool,
     webview: bool,
+    speech: bool,
     version: Option<String>,
 }
 
@@ -44,6 +45,7 @@ impl StandardRpcs {
             window: true,
             notify: true,
             webview: true,
+            speech: false,
             version: None,
         }
     }
@@ -86,6 +88,13 @@ impl StandardRpcs {
     /// `ui.webview.find / clearFind / print / pdf`.
     pub fn webview(mut self) -> Self {
         self.webview = true;
+        self
+    }
+
+    /// `ui.speech.listen / requestPermission` (macOS). Not in `all()`: it
+    /// needs microphone and speech usage strings in the app's Info.plist.
+    pub fn speech(mut self) -> Self {
+        self.speech = true;
         self
     }
 
@@ -399,6 +408,12 @@ pub(crate) fn install(mut b: WebViewBuilder, cfg: StandardRpcs) -> WebViewBuilde
                 },
             );
     }
+    #[cfg(target_os = "macos")]
+    if cfg.speech {
+        b = install_speech(b);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = cfg.speech;
     if cfg.notify {
         b = b
             .invoke(
@@ -422,6 +437,69 @@ pub(crate) fn install(mut b: WebViewBuilder, cfg: StandardRpcs) -> WebViewBuilde
             });
     }
     b
+}
+
+crate::ipc_struct! {
+    #[derive(Debug, Clone, Default)]
+    struct ListenOptions {
+        locale: Option<String>,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_speech(b: WebViewBuilder) -> WebViewBuilder {
+    use crate::macos::speech::{self, SpeechPermission};
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+    use std::time::Duration;
+
+    b.invoke_blocking("ui:speech.requestPermission", |_ctx: Context, ()| {
+        let (tx, rx) = channel();
+        speech::request_permission(move |p| {
+            let _ = tx.send(p);
+        });
+        let p = rx.recv().unwrap_or(SpeechPermission::Denied);
+        match p {
+            SpeechPermission::Authorized => "authorized",
+            SpeechPermission::Denied => "denied",
+            SpeechPermission::Restricted => "restricted",
+            SpeechPermission::NotDetermined => "not_determined",
+        }
+        .to_owned()
+    })
+    .invoke_stream(
+        "ui:speech.listen",
+        |ctx: Context, opts: Option<ListenOptions>, stream| -> Result<String> {
+            let locale = opts.and_then(|o| o.locale);
+            let (tx, rx) = channel();
+            let runtime = ctx.app().runtime.clone();
+            let session = runtime.call_main_sync(move || {
+                speech::listen(locale.as_deref(), move |r| {
+                    let _ = tx.send(r);
+                })
+            })?;
+            let mut last = String::new();
+            let outcome = loop {
+                match rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(Ok(t)) => {
+                        last = t.text.clone();
+                        let frame = Value::Object(BTreeMap::from([
+                            ("text".to_owned(), Value::String(t.text)),
+                            ("final".to_owned(), Value::Bool(t.is_final)),
+                        ]));
+                        if stream.send(frame).is_err() || t.is_final {
+                            break Ok(last);
+                        }
+                    }
+                    Ok(Err(e)) => break Err(e),
+                    Err(RecvTimeoutError::Timeout) if stream.is_closed() => break Ok(last),
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break Ok(last),
+                }
+            };
+            runtime.call_main_sync(move || drop(session));
+            outcome
+        },
+    )
 }
 
 #[cfg(test)]

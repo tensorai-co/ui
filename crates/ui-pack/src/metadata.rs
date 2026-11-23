@@ -30,6 +30,10 @@ pub struct AppMetadata {
     pub entitlements: Option<String>,
     /// Inline `[package.metadata.ui.entitlements]` keys, used when no file is named.
     pub entitlement_keys: Vec<(String, bool)>,
+    /// `NSMicrophoneUsageDescription`: why the app uses the microphone.
+    pub microphone_usage: Option<String>,
+    /// `NSSpeechRecognitionUsageDescription`: why the app uses speech recognition.
+    pub speech_usage: Option<String>,
     /// Command that starts the web dev server for `ui-pack run --dev`.
     pub dev_command: Option<String>,
     /// The dev server's URL for `ui-pack run --dev` (default `http://localhost:5173`).
@@ -78,6 +82,8 @@ impl AppMetadata {
         let mut entitlements = None;
         let mut entitlement_keys = Vec::new();
         let mut dev_command = None;
+        let mut microphone_usage = None;
+        let mut speech_usage = None;
         let mut dev_url = None;
 
         let mut section = String::new();
@@ -110,6 +116,8 @@ impl AppMetadata {
                         "document_types" => document_types = parse_list(raw),
                         "entitlements" => entitlements = Some(val),
                         "dev_command" => dev_command = Some(val),
+                        "microphone_usage" => microphone_usage = Some(val),
+                        "speech_usage" => speech_usage = Some(val),
                         "dev_url" => dev_url = Some(val),
                         "backend" => {
                             backend = match val.as_str() {
@@ -158,6 +166,8 @@ impl AppMetadata {
             entitlement_keys,
             dev_command,
             dev_url,
+            microphone_usage,
+            speech_usage,
             manifest_dir: PathBuf::from("."),
         })
     }

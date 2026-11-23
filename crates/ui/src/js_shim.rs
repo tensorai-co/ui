@@ -22,6 +22,7 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
   const SEND_OP_TITLEBAR_DOUBLE_CLICK = 0x04;
   const SEND_OP_CANCEL = 0x05;
   const SEND_OP_STREAM_DATA = 0x06;
+  const SEND_OP_FILE_DROP = 0x07;
   const RPC_FLAG_CALL_ID = 0x01;
   const RPC_FLAG_STREAM = 0x02;
   const STREAM_DATA_PREFIX = "__ui_stream:";
@@ -152,12 +153,15 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
     return out;
   }
 
-  function decodeWireValue(u8) {
+  // Channels whose bytes are delivered as views into the batch (no copy).
+  const viewChannels = new Set();
+
+  function decodeWireValue(u8, view) {
     if (u8.byteLength === 0) throw new Error("Empty binary IPC value");
     const tag = u8[0];
     if (tag === WIRE_NULL) return null;
     if (tag === WIRE_JSON_UTF8) return JSON.parse(dec.decode(u8.subarray(1)));
-    if (tag === WIRE_BYTES) return u8.slice(1);
+    if (tag === WIRE_BYTES) return view ? u8.subarray(1) : u8.slice(1);
     if (tag === WIRE_ARRAY) {
       const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
       const count = dv.getUint32(1, true);
@@ -166,7 +170,7 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
       for (let i = 0; i < count; i++) {
         const len = dv.getUint32(pos, true);
         pos += 4;
-        arr[i] = decodeWireValue(u8.subarray(pos, pos + len));
+        arr[i] = decodeWireValue(u8.subarray(pos, pos + len), view);
         pos += len;
       }
       return arr;
@@ -183,7 +187,7 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
         pos += keyLen;
         const valLen = dv.getUint32(pos, true);
         pos += 4;
-        obj[key] = decodeWireValue(u8.subarray(pos, pos + valLen));
+        obj[key] = decodeWireValue(u8.subarray(pos, pos + valLen), view);
         pos += valLen;
       }
       return obj;
@@ -330,6 +334,7 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
       offData();
       offEnd();
       offOpen();
+      viewChannels.delete(dataCh);
       pending.length = 0;
       dataListeners.clear();
     };
@@ -349,9 +354,12 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
     return Object.freeze({
       id: callId,
       closed,
-      on(event, fn) {
+      // { copy: false }: bytes arrive as views into the received batch, valid
+      // only during the callback (no per-chunk copy, e.g. for terminals).
+      on(event, fn, opts) {
         if (event !== "data") throw new TypeError("ipc stream only emits \"data\"");
         if (typeof fn !== "function") throw new TypeError("ipc listener must be a function");
+        if (opts && opts.copy === false) viewChannels.add(dataCh);
         dataListeners.add(fn);
         return () => dataListeners.delete(fn);
       },
@@ -416,7 +424,7 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
       pos += chLen;
       const frameLen = dv.getUint32(pos, true);
       pos += 4;
-      const payload = decodeWireValue(u8.subarray(pos, pos + frameLen));
+      const payload = decodeWireValue(u8.subarray(pos, pos + frameLen), viewChannels.has(channel));
       pos += frameLen;
       dispatchEvent(channel, payload);
     }
@@ -649,6 +657,18 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
     }
     return false;
   }
+
+  // Report file drops so engines without a native drop callback (CEF) can
+  // pair them with the paths recorded when the drag entered.
+  window.addEventListener("drop", function(ev) {
+    const dt = ev.dataTransfer;
+    if (!dt || !dt.files || dt.files.length === 0) return;
+    const at = encodeWireValue({ x: ev.clientX, y: ev.clientY });
+    const pkt = new Uint8Array(1 + at.byteLength);
+    pkt[0] = SEND_OP_FILE_DROP;
+    pkt.set(at, 1);
+    sendPacket(pkt);
+  }, true);
 
   // The second press of a double click is handled on mousedown, not `dblclick`:
   // the window drag started by the first press can swallow the click events.

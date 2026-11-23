@@ -26,7 +26,14 @@ fn log_event(line: &str) {
     }
 }
 
+ui::ipc_types! {
+    fn ipc_typescript;
+    invoke echo(text: String) -> String;
+}
+
 fn main() -> ui::Result<()> {
+    // `ui-pack gen-ts` writes `ipc.d.ts` from the declarations above.
+    ui::write_typescript_if_requested(ipc_typescript);
     ui::run(|app| {
         app.on_event(|ev| match ev {
             Event::OpenUrl(url) => log_event(&format!("open-url {url}")),

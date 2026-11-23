@@ -100,8 +100,31 @@ impl Value {
     }
 
     /// Serializes this value into RFC 8259 JSON text.
+    /// JSON text for this value. `Bytes` become a JSON number array (`[1,2,3]`,
+    /// 3–4× the size); IPC sends them as raw frames instead. Use
+    /// [`try_to_json`](Self::try_to_json) where binary must not be widened.
     pub fn to_json(&self) -> String {
         stringify(self)
+    }
+
+    /// JSON text for this value, or an error if it contains `Bytes` (which
+    /// only travel as binary wire frames).
+    pub fn try_to_json(&self) -> Result<String, DecodeError> {
+        if self.contains_bytes() {
+            return Err(DecodeError::new(
+                "value contains bytes; send it over IPC as a binary frame instead of JSON",
+            ));
+        }
+        Ok(stringify(self))
+    }
+
+    fn contains_bytes(&self) -> bool {
+        match self {
+            Self::Bytes(_) => true,
+            Self::Array(items) => items.iter().any(Self::contains_bytes),
+            Self::Object(map) => map.values().any(Self::contains_bytes),
+            _ => false,
+        }
     }
 
     /// Parses RFC 8259 JSON text into a `Value`.
@@ -1019,7 +1042,8 @@ macro_rules! json {
         $crate::ipc::Value::Array(::std::vec::Vec::new())
     };
     ([$($tt:tt)+]) => {{
-        let mut __arr = ::std::vec::Vec::new();
+        // `identity` keeps clippy's vec-init-then-push lint out of callers' code.
+        let mut __arr = ::std::convert::identity(::std::vec::Vec::new());
         $crate::__json_array!(__arr $($tt)+);
         $crate::ipc::Value::Array(__arr)
     }};
@@ -1248,6 +1272,31 @@ macro_rules! ipc_struct {
             }
         }
 
+        impl $crate::ts::TsType for $name {
+            fn ts_type() -> ::std::string::String {
+                ::std::string::String::from(::std::stringify!($name))
+            }
+            fn ts_declarations(out: &mut ::std::collections::BTreeMap<::std::string::String, ::std::string::String>) {
+                #[allow(unused_imports)]
+                use $crate::ts::{__TsFallback as _, __TsViaType as _};
+                let key = ::std::string::String::from(::std::stringify!($name));
+                if out.contains_key(&key) {
+                    return;
+                }
+                // Placeholder first, so recursive types terminate.
+                out.insert(key.clone(), ::std::string::String::new());
+                #[allow(unused_mut)]
+                let mut body = ::std::string::String::new();
+                $(
+                    (&$crate::ts::__TsProbe::<$ty>::new()).__ts_declarations(out);
+                    let ty = (&$crate::ts::__TsProbe::<$ty>::new()).__ts_type();
+                    let opt = if $crate::ts::__is_optional(&ty) { "?" } else { "" };
+                    body.push_str(&::std::format!("  {}{}: {};\n", ::std::stringify!($field), opt, ty));
+                )*
+                out.insert(key, ::std::format!("export interface {} {{\n{}}}\n", ::std::stringify!($name), body));
+            }
+        }
+
         impl $crate::ipc::IntoIpc for $name {
             fn into_ipc(self) -> $crate::ipc::Value {
                 #[allow(unused_mut)]
@@ -1301,6 +1350,7 @@ const SEND_OP_DRAG: u8 = 0x03;
 const SEND_OP_TITLEBAR_DOUBLE_CLICK: u8 = 0x04;
 const SEND_OP_CANCEL: u8 = 0x05;
 const SEND_OP_STREAM_DATA: u8 = 0x06;
+const SEND_OP_FILE_DROP: u8 = 0x07;
 
 /// RPC flag: a little-endian `u32` call id follows the flags byte.
 const RPC_FLAG_CALL_ID: u8 = 0x01;
@@ -1327,6 +1377,8 @@ pub(crate) enum ClientSendPacket {
     Cancel(u32),
     /// Data the page wrote into an open `ipc.stream(..)` with this id.
     StreamData(u32, Value),
+    /// The page saw files dropped at `{ x, y }` (CSS pixels).
+    FileDrop(Value),
 }
 
 struct WireCursor<'a> {
@@ -1595,6 +1647,9 @@ pub(crate) fn decode_send_packet(bytes: &[u8]) -> Result<ClientSendPacket, Decod
             let payload = decode_wire_value(cur.read_rest())?;
             Ok(ClientSendPacket::StreamData(id, payload))
         }
+        SEND_OP_FILE_DROP => Ok(ClientSendPacket::FileDrop(decode_wire_value(
+            cur.read_rest(),
+        )?)),
         op => Err(DecodeError::new(format!(
             "unknown binary send opcode 0x{op:02x}"
         ))),
@@ -1730,6 +1785,18 @@ mod tests {
             "{err}"
         );
         assert!(ExportRequest::from_ipc(&Value::Null).is_err());
+    }
+
+    #[test]
+    fn try_to_json_refuses_bytes() {
+        let v = crate::json!({ "a": [1, "x"] });
+        assert_eq!(v.try_to_json().unwrap(), v.to_json());
+        let nested = Value::Object(std::collections::BTreeMap::from([(
+            "data".to_owned(),
+            Value::Array(vec![Value::Bytes(vec![1])]),
+        )]));
+        assert!(nested.try_to_json().is_err());
+        assert_eq!(nested.to_json(), r#"{"data":[[1]]}"#);
     }
 
     #[test]

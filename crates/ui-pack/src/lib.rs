@@ -5,6 +5,7 @@ pub mod linux;
 pub mod macos;
 pub mod metadata;
 pub mod run;
+pub mod update;
 pub mod windows;
 
 #[cfg(test)]
@@ -37,6 +38,15 @@ mod tests {
             "leading dot stripped"
         );
         assert!(plist.contains("<key>CFBundleIconFile</key>\n  <string>AppIcon.icns</string>"));
+        let speechy = AppMetadata::parse(
+            "[package]\nname = \"d\"\n[package.metadata.ui]\nmicrophone_usage = \"Dictation\"\nspeech_usage = \"Turns speech into text\"\n",
+        )
+        .unwrap();
+        let p2 = render_info_plist(&speechy, "d");
+        assert!(
+            p2.contains("<key>NSMicrophoneUsageDescription</key>\n  <string>Dictation</string>")
+        );
+        assert!(p2.contains("<key>NSSpeechRecognitionUsageDescription</key>"));
 
         let appx = render_appx_manifest(&meta, "notes.exe", "CN=Example");
         assert!(appx.contains(r#"<uap:Protocol Name="notes" />"#));

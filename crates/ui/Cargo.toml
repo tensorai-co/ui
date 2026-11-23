@@ -16,6 +16,12 @@ workspace = true
 [features]
 default = []
 cef = ["dep:ui-cef-sys"]
+# `ui::Serde<T>`: any serde type as an IPC argument or result. Off by default,
+# so the default build has no third-party dependencies.
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1", optional = true, default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 ui-cef-sys = { version = "0.1.0", path = "../ui-cef-sys", optional = true }

@@ -176,6 +176,50 @@ From an `.app` bundle these use the system notification center, with the app's o
 
 `webview.find(text, FindOptions::default(), |found| …)` / `clear_find()` (find in page; CEF can't report matches), `print()`, `pdf(|bytes| …)` (WebKit), and `WebViewEvent::FileDrop { paths, x, y }` with real filesystem paths for dropped files (WebKit; pages also get `ui:file-drop`). Page zoom set with `set_zoom` or the View menu is remembered per profile. With `.standard_rpcs(..)`, pages reach these as `ui.webview.find / clearFind / print / pdf / onFileDrop`. `.mirror_theme()` makes the window's appearance follow the page's `<html data-theme>`.
 
+### Typed Calls in TypeScript
+
+```rust
+ui::ipc_types! {
+    fn ipc_typescript;
+    invoke export_report(req: ExportRequest) -> Report;
+    stream term_open(rows: u16, cols: u16) -> i32, data: Bytes;
+}
+
+fn main() -> ui::Result<()> {
+    ui::write_typescript_if_requested(ipc_typescript); // for `ui-pack gen-ts`
+    ui::run(|app| { /* … */ })
+}
+```
+
+`ui-pack gen-ts --out web/src/ipc.d.ts` writes the `interface`s for every `ipc_struct!` involved plus `IpcInvoke` / `IpcStreams`; then `typed<IpcInvoke, IpcStreams>()` from `ui-client` checks call names, arguments and results at compile time. Types without a TypeScript mapping come out as `unknown`.
+
+### Signed Update Checks
+
+```sh
+ui-pack update-key --out keys/          # keys/update-private.pem (keep secret) + the public key to embed
+ui-pack update-feed keys/update-private.pem 1.3.0 https://example.com/App-1.3.0.zip "Release notes" > feed.json
+```
+
+```rust
+if let Some(update) = ui::update::check("https://example.com/feed.json", PUBLIC_KEY, env!("CARGO_PKG_VERSION"))? {
+    // update.version, update.url, update.notes — verified against PUBLIC_KEY
+}
+```
+
+Feeds are ECDSA P-256 signed and verified with the system Security framework (macOS), so there's no crypto dependency; only `https://` feeds are fetched.
+
+### Speech to Text (macOS)
+
+WKWebView has no Web Speech API, so `ui::macos::speech` provides one: `speech::request_permission(..)`, then `speech::listen(Some("en-US"), |t| …)` delivers partial and final transcripts until the session is stopped. Pages use `ui.speech.listen()` (a stream of `{ text, final }`) with `StandardRpcs::none().speech()`. It needs an app bundle with `microphone_usage` and `speech_usage` set in `[package.metadata.ui]` (and the `com.apple.security.device.audio-input` entitlement under the hardened runtime); without them it returns an error instead of letting macOS kill the app.
+
+### Optional `serde` Support
+
+```toml
+ui = { git = "https://github.com/tensorai-co/ui", features = ["serde"] }
+```
+
+`ui::Serde<T>` makes any `Serialize`/`Deserialize` type an IPC argument or result, converted straight to and from the IPC value tree (no JSON text in between). The default build has no third-party dependencies.
+
 ### Deep Links, Opened Files & Single Instance
 
 ```toml
@@ -197,7 +241,7 @@ Pages get the same with `ui.app.on("open-url", fn)` / `ui.app.on("open-files", f
 
 ### Renamed in 0.2
 
-v1 names still compile as `#[deprecated]` aliases for one release, each pointing at its replacement: `TitleBar::inset(..).traffic_lights(x, y)` → `TitleBar::overlay(..).window_controls(WindowControls::at(x, y))`, `TitleBar::Hidden` → `Frameless`, `Backdrop::{Transient, Mica, Acrylic}` → `Popover` / `Window`, `Role::Zoom` → `Maximize`, `Event::Reopen` → `Activate`, `Shortcut::cmd(_shift)` → `primary(_shift)`, `.inspectable` → `.devtools`, `.rpc` → `.invoke`, `.on_msg` → `.on_command`, `Nav::{Cancel, External}` → `NavDecision::{Block, OpenInBrowser}`, `.on_popup` → `.on_new_window`, `.external_links` → `.open_links_in_browser`, `Display` / `displays()` → `Monitor` / `monitors()`, `Mod` → `Modifiers`, `Ctx` → `Context`, `WindowBuilder::tabbing` → `.macos(|m| m.tabbing(..))`, and in JS `ipc.send` → `ipc.emit`.
+v1 names still compile as `#[deprecated]` aliases for one release, each pointing at its replacement: `TitleBar::inset(..).traffic_lights(x, y)` → `TitleBar::overlay(..).window_controls(WindowControls::at(x, y))`, `TitleBar::Hidden` → `Frameless`, `Role::{Hide, HideOthers, ShowAll}` → `ui::macos::Role::…`, `Backdrop::{Transient, Mica, Acrylic}` → `Popover` / `Window`, `Role::Zoom` → `Maximize`, `Event::Reopen` → `Activate`, `Shortcut::cmd(_shift)` → `primary(_shift)`, `.inspectable` → `.devtools`, `.rpc` → `.invoke`, `.on_msg` → `.on_command`, `Nav::{Cancel, External}` → `NavDecision::{Block, OpenInBrowser}`, `.on_popup` → `.on_new_window`, `.external_links` → `.open_links_in_browser`, `Display` / `displays()` → `Monitor` / `monitors()`, `Mod` → `Modifiers`, `Ctx` → `Context`, `WindowBuilder::tabbing` → `.macos(|m| m.tabbing(..))`, and in JS `ipc.send` → `ipc.emit`.
 
 ### Hosted URL App & Typed Commands
 
@@ -352,7 +396,7 @@ UI_BACKEND=webkit cargo test -p ui --test conformance --features cef
 
 ## API Overview
 
-Root `ui::*` re-exports the core surface (`run`, `App`, `SingleInstance`, `Window`, `WebView`, `Context`, `Stream`, `TitleBar`, `WindowControls`, `Backdrop`, `Monitor`, `Profile`, `NavDecision`, `NavRequest`, `FindOptions`, `Notification`, `Request`, `Response`, `Menu`, `Dialog`, `Bytes`, `Value`, `DecodeError`, `FromIpc`, `IntoIpc`, `RpcResult`, `Error`, `Result`, `json!`, `ipc_enum!`, `ipc_struct!`), organized into focused submodules:
+Root `ui::*` re-exports the core surface (`TsType`, `write_typescript_if_requested`, `run`, `App`, `SingleInstance`, `Window`, `WebView`, `Context`, `Stream`, `TitleBar`, `WindowControls`, `Backdrop`, `Monitor`, `Profile`, `NavDecision`, `NavRequest`, `FindOptions`, `Notification`, `Request`, `Response`, `Menu`, `Dialog`, `Bytes`, `Value`, `DecodeError`, `FromIpc`, `IntoIpc`, `RpcResult`, `Error`, `Result`, `json!`, `ipc_enum!`, `ipc_struct!`), organized into focused submodules:
 
 ```text
 ui
@@ -363,7 +407,9 @@ ui
 ├── ipc        // Bytes, Value, FromIpc, IntoIpc, DecodeError, RpcResult (+ json!, ipc_enum!, ipc_struct!)
 ├── menu       // Menu, Submenu, MenuItem, MenuItemHandle, MenuItemUpdate, ContextMenuItem, Role, Shortcut, Modifiers
 ├── standard   // StandardRpcs (ui.app / dialog / clipboard / window / notify page calls)
-├── macos      // AppExt, WindowBuilderExt, WindowExt, Dock, MacWindowOptions, ToolbarStyle, Tabbing (macOS only)
+├── macos      // AppExt, WindowBuilderExt, WindowExt, Dock, MacWindowOptions, ToolbarStyle, Tabbing, Role, speech (macOS only)
+├── ts         // TsType, ipc_types!, write_typescript_if_requested
+├── update     // check, verify_feed, UpdateInfo
 ├── dialog     // Dialog, FileDialog, MessageDialog, Filter, MessageLevel, MessageButtons, MessageResult
 ├── event      // Event, WindowEvent, WebViewEvent
 ├── platform   // RawWindowHandle, RawWebViewHandle
@@ -385,6 +431,7 @@ cargo run -p ui-pack -- macos --manifest path/to/Cargo.toml --bin target/release
 cargo run -p ui-pack -- run --manifest path/to/Cargo.toml [--release] [--dev]   # build, sign with entitlements, launch
 cargo run -p ui-pack -- icons assets/app-icon.png                              # AppIcon.iconset + AppIcon.icns
 cargo ui run --dev                                                             # same commands via the cargo-ui binary
+cargo ui gen-ts --out web/src/ipc.d.ts                                         # TypeScript for ipc_types!
 ```
 
 Notarize a Developer ID build with `ui-pack macos --sign "Developer ID Application: …" --notarize <keychain-profile>` (zips, submits with `notarytool --wait`, staples). Entitlements can also be inline:

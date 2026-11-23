@@ -64,6 +64,15 @@ export const ipc = new Proxy({}, {
   },
 });
 
+/**
+ * `ipc` typed by the declarations `ui-pack gen-ts` writes:
+ * `typed<IpcInvoke, IpcStreams>().invoke("export_report", req)` is checked.
+ * At runtime it is `ipc` itself.
+ */
+export function typed() {
+  return ipc;
+}
+
 function call(method, ...args) {
   return ipc.invoke(method, ...args);
 }
@@ -202,6 +211,15 @@ export const ui = Object.freeze({
   menu: Object.freeze({
     on: (id, fn) => ipc.menu.on(id, fn),
     set: (update) => ipc.menu.set(update),
+  }),
+  speech: Object.freeze({
+    /** "authorized" | "denied" | "restricted" | "not_determined"; prompts once. */
+    requestPermission: () => call("ui:speech.requestPermission"),
+    /**
+     * Listens on the microphone: data frames are { text, final }; `closed`
+     * resolves with the last text. `close()` stops listening. macOS.
+     */
+    listen: (options) => ipc.stream("ui:speech.listen", options || null),
   }),
   /** Native context menu; resolves to the chosen id or null. Web: always null. */
   contextMenu(items, position) {

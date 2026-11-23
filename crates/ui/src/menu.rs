@@ -82,9 +82,9 @@ pub enum Role {
     Settings,
     /// The system Services submenu (macOS).
     Services,
-    Hide,
-    HideOthers,
-    ShowAll,
+    /// A macOS-only role, from [`ui::macos::Role`](crate::macos::Role).
+    #[cfg(target_os = "macos")]
+    MacOs(crate::macos::Role),
     Quit,
     Undo,
     Redo,
@@ -121,6 +121,18 @@ pub enum Role {
 impl Role {
     #[deprecated(since = "0.2.0", note = "renamed to `Role::Maximize`")]
     pub const Zoom: Self = Self::Maximize;
+    #[cfg(target_os = "macos")]
+    #[deprecated(since = "0.2.0", note = "macOS-only: use `ui::macos::Role::Hide`")]
+    pub const Hide: Self = Self::MacOs(crate::macos::Role::Hide);
+    #[cfg(target_os = "macos")]
+    #[deprecated(
+        since = "0.2.0",
+        note = "macOS-only: use `ui::macos::Role::HideOthers`"
+    )]
+    pub const HideOthers: Self = Self::MacOs(crate::macos::Role::HideOthers);
+    #[cfg(target_os = "macos")]
+    #[deprecated(since = "0.2.0", note = "macOS-only: use `ui::macos::Role::ShowAll`")]
+    pub const ShowAll: Self = Self::MacOs(crate::macos::Role::ShowAll);
 
     /// Roles the runtime carries out on the focused webview, rather than the OS.
     pub(crate) fn is_webview_role(self) -> bool {
@@ -197,17 +209,23 @@ impl MenuItem {
         }
     }
 
-    pub fn role(role: Role) -> Self {
+    /// A standard item for `role`: a core [`Role`] or a platform one such as
+    /// [`ui::macos::Role`](crate::macos::Role).
+    pub fn role(role: impl Into<Role>) -> Self {
+        let role = role.into();
         let (title, shortcut) = match role {
             Role::About => ("About", None),
             Role::Settings => ("Settings…", Some(Shortcut::primary(","))),
             Role::Services => ("Services", None),
-            Role::Hide => ("Hide", Some(Shortcut::primary("h"))),
-            Role::HideOthers => (
+            #[cfg(target_os = "macos")]
+            Role::MacOs(crate::macos::Role::Hide) => ("Hide", Some(Shortcut::primary("h"))),
+            #[cfg(target_os = "macos")]
+            Role::MacOs(crate::macos::Role::HideOthers) => (
                 "Hide Others",
                 Some(Shortcut::new(Modifiers::PRIMARY | Modifiers::ALT, "h")),
             ),
-            Role::ShowAll => ("Show All", None),
+            #[cfg(target_os = "macos")]
+            Role::MacOs(crate::macos::Role::ShowAll) => ("Show All", None),
             Role::Quit => ("Quit", Some(Shortcut::primary("q"))),
             Role::Undo => ("Undo", Some(Shortcut::primary("z"))),
             Role::Redo => ("Redo", Some(Shortcut::primary_shift("z"))),
@@ -362,19 +380,19 @@ impl Menu {
     /// Add a Settings item with [`with_settings`](Self::with_settings). On macOS the
     /// Help menu gets the system's menu search field.
     pub fn standard() -> Self {
+        let app = Submenu::new("App")
+            .item(MenuItem::role(Role::About))
+            .separator()
+            .item(MenuItem::role(Role::Services))
+            .separator();
+        #[cfg(target_os = "macos")]
+        let app = app
+            .item(MenuItem::role(crate::macos::Role::Hide))
+            .item(MenuItem::role(crate::macos::Role::HideOthers))
+            .item(MenuItem::role(crate::macos::Role::ShowAll))
+            .separator();
         Self::new()
-            .submenu(
-                Submenu::new("App")
-                    .item(MenuItem::role(Role::About))
-                    .separator()
-                    .item(MenuItem::role(Role::Services))
-                    .separator()
-                    .item(MenuItem::role(Role::Hide))
-                    .item(MenuItem::role(Role::HideOthers))
-                    .item(MenuItem::role(Role::ShowAll))
-                    .separator()
-                    .item(MenuItem::role(Role::Quit)),
-            )
+            .submenu(app.item(MenuItem::role(Role::Quit)))
             .submenu(
                 Submenu::new("Edit")
                     .item(MenuItem::role(Role::Undo))

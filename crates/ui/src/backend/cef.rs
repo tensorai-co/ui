@@ -20,7 +20,7 @@ use crate::backend::{
     IpcEndpoint, IpcReplyTarget, IpcResponder, IpcRouteAction, ipc_binary_response,
 };
 use crate::event::WebViewEvent;
-use crate::ipc::{CallSpec, Value, encode_base64, encode_rpc_response};
+use crate::ipc::{CallSpec, Value, encode_rpc_response};
 use crate::js_shim::SHIM_JS;
 #[cfg(not(target_os = "macos"))]
 use crate::platform;
@@ -47,6 +47,7 @@ use ui_cef_sys::{
     cef_scheme_handler_factory_t, cef_scheme_registrar_t, cef_settings_t, cef_string_t,
     cef_window_info_t, cef_window_open_disposition_t,
 };
+use ui_cef_sys::{cef_drag_data_t, cef_drag_handler_t, cef_find_handler_t};
 
 pub(crate) enum CefNotification {
     Event(WebViewId, WebViewEvent),
@@ -180,6 +181,11 @@ static WV_SCHEMES: Mutex<Option<HashMap<WebViewId, BTreeMap<String, AssetHandler
     Mutex::new(None);
 static WV_ENDPOINTS: Mutex<Option<HashMap<WebViewId, Arc<IpcEndpoint>>>> = Mutex::new(None);
 static PENDING_BROWSER_WVS: Mutex<Vec<WebViewId>> = Mutex::new(Vec::new());
+/// `WebView::html()` pages, served at `ui-ipc://page/` instead of a base64 `data:` URL.
+static INLINE_HTML: Mutex<Option<HashMap<WebViewId, String>>> = Mutex::new(None);
+
+/// Where an inline page is served from.
+const INLINE_PAGE_URL: &str = "ui-ipc://page/";
 static LIVE_BROWSERS: Mutex<Option<HashSet<i32>>> = Mutex::new(None);
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -837,6 +843,19 @@ fn resolve_scheme_handler(
             g.first().copied()
         });
 
+    if scheme == IPC_SCHEME && url.starts_with(INLINE_PAGE_URL) {
+        let page = wv_id.and_then(|id| {
+            INLINE_HTML
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|m| m.get(&id).cloned())
+        });
+        return alloc_resource_handler(match page {
+            Some(html) => Response::html(html).with_header("Cache-Control", "no-store"),
+            None => Response::not_found(),
+        });
+    }
     if scheme == IPC_SCHEME {
         // SAFETY: `request` is valid for the synchronous `resolve_scheme_handler` call.
         let body = unsafe { extract_cef_post_body(request) };
@@ -924,6 +943,112 @@ struct ClientData {
     load: SendPtr<cef_load_handler_t>,
     display: SendPtr<cef_display_handler_t>,
     request: SendPtr<cef_request_handler_t>,
+    find: SendPtr<cef_find_handler_t>,
+    drag: SendPtr<cef_drag_handler_t>,
+}
+
+type FindCallback = Box<dyn FnOnce(Option<bool>) + Send>;
+
+/// The `find` call waiting for its final `on_find_result`, per webview.
+static PENDING_FIND: Mutex<Option<HashMap<WebViewId, FindCallback>>> = Mutex::new(None);
+/// Paths of the files being dragged over each webview (from `on_drag_enter`).
+static DRAG_PATHS: Mutex<Option<HashMap<WebViewId, Vec<std::path::PathBuf>>>> = Mutex::new(None);
+
+/// The paths recorded when the drag entered, for the page's drop report.
+pub(crate) fn take_drag_paths(id: WebViewId) -> Vec<std::path::PathBuf> {
+    DRAG_PATHS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|m| m.remove(&id))
+        .unwrap_or_default()
+}
+
+unsafe extern "C" fn find_on_result(
+    self_ptr: *mut cef_find_handler_t,
+    browser: *mut cef_browser_t,
+    _identifier: c_int,
+    count: c_int,
+    _rect: *const c_void,
+    _active: c_int,
+    final_update: c_int,
+) {
+    // SAFETY: Release the browser reference CEF passed in.
+    unsafe { cef_release(browser) };
+    if final_update == 0 {
+        return;
+    }
+    // SAFETY: `self_ptr` points to a live `CefObj<cef_find_handler_t, SubHandlerData>`.
+    let wv = unsafe { cef_obj_data::<cef_find_handler_t, SubHandlerData>(self_ptr) }.wv_id;
+    let cb = PENDING_FIND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|m| m.remove(&wv));
+    if let Some(cb) = cb {
+        cb(Some(count > 0));
+    }
+}
+
+unsafe extern "C" fn drag_on_enter(
+    self_ptr: *mut cef_drag_handler_t,
+    browser: *mut cef_browser_t,
+    data: *mut cef_drag_data_t,
+    _mask: u32,
+) -> c_int {
+    // SAFETY: `self_ptr` points to a live `CefObj<cef_drag_handler_t, SubHandlerData>`.
+    let wv = unsafe { cef_obj_data::<cef_drag_handler_t, SubHandlerData>(self_ptr) }.wv_id;
+    let mut paths = Vec::new();
+    if let Ok(api) = CefApi::get()
+        && !data.is_null()
+    {
+        // SAFETY: `data` is valid for this callback; the list is ours to free.
+        unsafe {
+            if (*data).is_file.is_some_and(|f| f(data) != 0)
+                && let Some(get) = (*data).get_file_paths
+            {
+                let list = (api.cef_string_list_alloc)();
+                get(data, list);
+                paths = api
+                    .string_list(list)
+                    .into_iter()
+                    .map(std::path::PathBuf::from)
+                    .collect();
+                (api.cef_string_list_free)(list);
+            }
+        }
+    }
+    DRAG_PATHS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(wv, paths);
+    // SAFETY: Release references CEF passed in.
+    unsafe {
+        cef_release(data);
+        cef_release(browser);
+    }
+    0 // let the page handle the drag
+}
+
+unsafe extern "C" fn client_get_find_handler(self_ptr: *mut cef_client_t) -> *mut c_void {
+    // SAFETY: `self_ptr` points to live `CefObj<cef_client_t, ClientData>`.
+    let ptr = unsafe { cef_obj_data::<cef_client_t, ClientData>(self_ptr) }
+        .find
+        .get();
+    // SAFETY: Transfers +1 ref to CEF caller.
+    unsafe { cef_add_ref(ptr) };
+    ptr.cast()
+}
+
+unsafe extern "C" fn client_get_drag_handler(self_ptr: *mut cef_client_t) -> *mut c_void {
+    // SAFETY: `self_ptr` points to live `CefObj<cef_client_t, ClientData>`.
+    let ptr = unsafe { cef_obj_data::<cef_client_t, ClientData>(self_ptr) }
+        .drag
+        .get();
+    // SAFETY: Transfers +1 ref to CEF caller.
+    unsafe { cef_add_ref(ptr) };
+    ptr.cast()
 }
 
 struct SubHandlerData {
@@ -1655,15 +1780,41 @@ fn alloc_client(wv_id: WebViewId, win_id: WindowId) -> *mut cef_client_t {
         },
     );
 
+    let find = alloc_cef_obj::<cef_find_handler_t, _>(
+        SubHandlerData {
+            wv_id,
+            win_id,
+            resource_request: None,
+        },
+        |s, base| {
+            s.base = base;
+            s.on_find_result = Some(find_on_result);
+        },
+    );
+    let drag = alloc_cef_obj::<cef_drag_handler_t, _>(
+        SubHandlerData {
+            wv_id,
+            win_id,
+            resource_request: None,
+        },
+        |s, base| {
+            s.base = base;
+            s.on_drag_enter = Some(drag_on_enter);
+        },
+    );
     alloc_cef_obj::<cef_client_t, _>(
         ClientData {
             life_span: SendPtr(life_span),
             load: SendPtr(load),
             display: SendPtr(display),
             request: SendPtr(request),
+            find: SendPtr(find),
+            drag: SendPtr(drag),
         },
         |s, base| {
             s.base = base;
+            s.get_find_handler = Some(client_get_find_handler);
+            s.get_drag_handler = Some(client_get_drag_handler);
             s.get_life_span_handler = Some(client_get_life_span_handler);
             s.get_load_handler = Some(client_get_load_handler);
             s.get_display_handler = Some(client_get_display_handler);
@@ -1903,20 +2054,25 @@ pub(crate) fn shutdown() {
 // WebView mounting & operations
 // ---------------------------------------------------------------------------
 
-fn html_to_data_url(html: &str, base: Option<&str>) -> String {
-    let final_html = if let Some(b) = base {
-        let escaped = b.replace('"', "&quot;");
-        let base_tag = format!("<base href=\"{escaped}\">");
-        if html.contains("<head>") {
-            html.replacen("<head>", &format!("<head>{base_tag}"), 1)
-        } else {
-            format!("{base_tag}{html}")
+/// Stores `html` for the webview and returns the internal URL that serves it.
+fn inline_page_url(id: WebViewId, html: &str, base: Option<&str>) -> String {
+    let page = match base {
+        Some(b) => {
+            let base_tag = format!("<base href=\"{}\">", b.replace('"', "&quot;"));
+            if html.contains("<head>") {
+                html.replacen("<head>", &format!("<head>{base_tag}"), 1)
+            } else {
+                format!("{base_tag}{html}")
+            }
         }
-    } else {
-        html.to_owned()
+        None => html.to_owned(),
     };
-    let encoded = encode_base64(final_html.as_bytes());
-    format!("data:text/html;charset=utf-8;base64,{encoded}")
+    INLINE_HTML
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(id, page);
+    INLINE_PAGE_URL.to_owned()
 }
 
 fn sanitize_profile_dir_name(name: &str) -> String {
@@ -2060,7 +2216,7 @@ pub(crate) fn mount_cef_webview(
 
     let start_url = match &spec.initial {
         InitialContent::Url(u) => u.clone(),
-        InitialContent::Html { html, base_url } => html_to_data_url(html, base_url.as_deref()),
+        InitialContent::Html { html, base_url } => inline_page_url(id, html, base_url.as_deref()),
         InitialContent::None => "about:blank".to_owned(),
     };
 
@@ -2223,7 +2379,7 @@ pub(crate) fn load_url(id: WebViewId, url: &str) {
 }
 
 pub(crate) fn load_html(id: WebViewId, html: &str, base: Option<&str>) {
-    let url = html_to_data_url(html, base);
+    let url = inline_page_url(id, html, base);
     load_url(id, &url);
 }
 
@@ -2270,8 +2426,7 @@ pub(crate) fn go_forward(id: WebViewId) {
     });
 }
 
-/// Finds `text` in the page. CEF reports matches through a separate handler
-/// that `ui` doesn't wire up, so `f` gets `None`.
+/// Finds `text` in the page; `f` gets the result from `on_find_result`.
 pub(crate) fn find(
     id: WebViewId,
     text: &str,
@@ -2279,6 +2434,15 @@ pub(crate) fn find(
     backwards: bool,
     f: Box<dyn FnOnce(Option<bool>) + Send>,
 ) {
+    // A newer search supersedes one still waiting for its result.
+    let previous = PENDING_FIND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(id, f);
+    if let Some(prev) = previous {
+        prev(None);
+    }
     with_browser(id, |api, _, host| {
         if host.is_null() {
             return;
@@ -2298,7 +2462,6 @@ pub(crate) fn find(
             }
         }
     });
-    f(None);
 }
 
 pub(crate) fn clear_find(id: WebViewId) {
@@ -2536,6 +2699,15 @@ pub(crate) fn cleanup_webviews_for_window(win_id: WindowId) {
             })
             .collect()
     });
+    if let Some(m) = INLINE_HTML
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        for id in &ids {
+            m.remove(id);
+        }
+    }
     for id in ids {
         cleanup_webview(id);
     }

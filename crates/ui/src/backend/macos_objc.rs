@@ -66,6 +66,12 @@ unsafe extern "C" {}
 #[link(name = "UserNotifications", kind = "framework")]
 unsafe extern "C" {}
 
+#[link(name = "Speech", kind = "framework")]
+unsafe extern "C" {}
+
+#[link(name = "AVFAudio", kind = "framework")]
+unsafe extern "C" {}
+
 #[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {
     pub(crate) static NSDefaultRunLoopMode: Id;
@@ -467,6 +473,83 @@ pub(crate) fn with_callback_block(f: impl FnOnce(isize) + Send + 'static, api: i
         reserved: 0,
         invoke: callback_invoke,
         descriptor: &CALLBACK_DESCRIPTOR,
+        ctx: Arc::into_raw(ctx),
+    };
+    api((&raw mut blk).cast::<c_void>());
+    // SAFETY: Balances `Arc::into_raw` above; heap copies hold their own references.
+    unsafe { drop(Arc::from_raw(blk.ctx)) };
+}
+
+type RepeatFn = Mutex<Box<dyn FnMut(isize, isize) + Send>>;
+
+#[repr(C)]
+struct RustRepeatDescriptor {
+    reserved: usize,
+    size: usize,
+    copy_helper: unsafe extern "C" fn(*mut RustRepeatBlock, *const RustRepeatBlock),
+    dispose_helper: unsafe extern "C" fn(*mut RustRepeatBlock),
+}
+
+/// A block Cocoa may call many times, with two pointer-sized arguments
+/// (e.g. an audio tap's buffer and time, or a result handler's result and error).
+#[repr(C)]
+pub(crate) struct RustRepeatBlock {
+    isa: *const c_void,
+    flags: i32,
+    reserved: i32,
+    invoke: unsafe extern "C" fn(*mut RustRepeatBlock, isize, isize),
+    descriptor: *const RustRepeatDescriptor,
+    ctx: *const RepeatFn,
+}
+
+unsafe extern "C" fn repeat_copy(dst: *mut RustRepeatBlock, src: *const RustRepeatBlock) {
+    // SAFETY: Both blocks hold an `Arc<RepeatFn>` raw pointer.
+    unsafe {
+        let ptr = (*src).ctx;
+        Arc::increment_strong_count(ptr);
+        (*dst).ctx = ptr;
+    }
+}
+
+unsafe extern "C" fn repeat_dispose(blk: *mut RustRepeatBlock) {
+    // SAFETY: Balances the reference this block copy holds.
+    unsafe {
+        let ptr = (*blk).ctx;
+        if !ptr.is_null() {
+            drop(Arc::from_raw(ptr));
+            (*blk).ctx = std::ptr::null();
+        }
+    }
+}
+
+unsafe extern "C" fn repeat_invoke(blk: *mut RustRepeatBlock, a: isize, b: isize) {
+    // SAFETY: `ctx` is live while any copy of the block exists.
+    let f = unsafe { &*(*blk).ctx };
+    let mut f = f.lock().unwrap_or_else(|e| e.into_inner());
+    f(a, b);
+}
+
+static REPEAT_DESCRIPTOR: RustRepeatDescriptor = RustRepeatDescriptor {
+    reserved: 0,
+    size: std::mem::size_of::<RustRepeatBlock>(),
+    copy_helper: repeat_copy,
+    dispose_helper: repeat_dispose,
+};
+
+/// Calls `api` with a block that runs `f(a, b)` each time Cocoa invokes it.
+pub(crate) fn with_repeat_block(
+    f: impl FnMut(isize, isize) + Send + 'static,
+    api: impl FnOnce(Id),
+) {
+    let ctx: Arc<RepeatFn> = Arc::new(Mutex::new(Box::new(f)));
+    // SAFETY: `_NSConcreteStackBlock` is the standard stack-block isa symbol exported by libSystem.
+    let isa = unsafe { _NSConcreteStackBlock };
+    let mut blk = RustRepeatBlock {
+        isa,
+        flags: 1 << 25, // BLOCK_HAS_COPY_DISPOSE
+        reserved: 0,
+        invoke: repeat_invoke,
+        descriptor: &REPEAT_DESCRIPTOR,
         ctx: Arc::into_raw(ctx),
     };
     api((&raw mut blk).cast::<c_void>());

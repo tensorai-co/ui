@@ -27,7 +27,11 @@ export interface IpcStream<T = IpcValue> {
   /** Resolves with the Rust handler's return value; rejects with its error. */
   readonly closed: Promise<IpcValue>;
   /** Frames sent with Rust's `Stream::send`, in order. */
-  on(event: "data", fn: (data: T) => void): Unsubscribe;
+  /**
+   * `{ copy: false }` delivers bytes as views into the received batch (no
+   * per-chunk copy); they're only valid during the callback.
+   */
+  on(event: "data", fn: (data: T) => void, options?: { copy?: boolean }): Unsubscribe;
   /** Data for Rust's `Stream::recv`. */
   send(...data: IpcValue[]): void;
   /** Closes the stream: Rust's `Stream::is_closed()` turns true. */
@@ -86,6 +90,25 @@ export interface Ipc {
 }
 
 export const ipc: Ipc;
+
+type Fn = (...args: any[]) => any;
+
+/** `ipc` with `invoke` / `stream` checked against generated `IpcInvoke` / `IpcStreams`. */
+export interface TypedIpc<I, S> extends Omit<Ipc, "invoke" | "stream"> {
+  invoke<K extends keyof I & string>(
+    method: K,
+    ...args: I[K] extends Fn ? Parameters<I[K]> | [...Parameters<I[K]>, CallOptions] : never
+  ): Promise<I[K] extends Fn ? ReturnType<I[K]> : never>;
+  stream<K extends keyof S & string>(
+    method: K,
+    ...args: S[K] extends { args: infer A extends unknown[] } ? A : never
+  ): Omit<IpcStream<S[K] extends { data: infer D } ? D : unknown>, "closed"> & {
+    readonly closed: Promise<S[K] extends { result: infer R } ? R : unknown>;
+  };
+}
+
+/** Types `ipc` with the declarations `ui-pack gen-ts` generates. */
+export function typed<I, S = {}>(): TypedIpc<I, S>;
 
 /** True inside a ui webview. */
 export function isNative(): boolean;
@@ -179,6 +202,11 @@ export const ui: {
   readonly menu: {
     on(id: string, fn: () => void): Unsubscribe;
     set(update: MenuItemUpdate): Promise<boolean>;
+  };
+  /** Speech to text from the microphone (macOS; enable with `StandardRpcs::speech()`). */
+  readonly speech: {
+    requestPermission(): Promise<"authorized" | "denied" | "restricted" | "not_determined">;
+    listen(options?: { locale?: string }): IpcStream<{ text: string; final: boolean }>;
   };
   /** Native context menu; resolves to the chosen id, or null when dismissed (always null on the web). */
   contextMenu(items: ContextMenuItem[], position?: { x: number; y: number }): Promise<string | null>;

@@ -138,6 +138,8 @@ fn check_pure_rust_contracts() {
         assert_eq!(ui::Backdrop::Transient, ui::Backdrop::Popover);
         assert_eq!(ui::Backdrop::Mica, ui::Backdrop::Window);
         assert_eq!(Role::Zoom, Role::Maximize);
+        #[cfg(target_os = "macos")]
+        assert_eq!(Role::Hide, Role::from(ui::macos::Role::Hide));
         assert_eq!(ui::event::Event::Reopen, ui::event::Event::Activate);
         assert_eq!(ui::Nav::Cancel, NavDecision::Block);
         assert_eq!(ui::Nav::External, NavDecision::OpenInBrowser);
@@ -338,7 +340,8 @@ async function boot() {
   }
   const chunks = [];
   const counter = ipc.stream("count", 4);
-  counter.on("data", (b) => chunks.push(b[0]));
+  // Zero-copy views: read inside the callback.
+  counter.on("data", (b) => chunks.push(b[0]), { copy: false });
   counter.send(new Uint8Array([40]));
   const closedWith = await counter.closed;
   let misuse = false;
@@ -686,19 +689,9 @@ boot();"#;
             external_blocked: true,
             clip_ok: true,
             bad_menu_rejected: true,
-            // WebKit reports matches and renders PDFs; CEF does neither through `ui`.
-            found: if g.backend == "webkit" {
-                "true"
-            } else {
-                "null"
-            }
-            .into(),
-            not_found: if g.backend == "webkit" {
-                "false"
-            } else {
-                "null"
-            }
-            .into(),
+            // Both engines report find matches; only WebKit renders PDFs.
+            found: "true".into(),
+            not_found: "false".into(),
             pdf_head: if g.backend == "webkit" {
                 "%PDF-"
             } else {

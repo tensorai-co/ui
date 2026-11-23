@@ -56,6 +56,32 @@ pub fn run(meta: &AppMetadata, opts: &RunOptions) -> Result<i32, String> {
     Ok(status?.code().unwrap_or(1))
 }
 
+/// Builds the app and runs it with `UI_GEN_TS=<out>`, so its
+/// `ui::write_typescript_if_requested(..)` writes the `ipc_types!` declarations.
+pub fn gen_ts(meta: &AppMetadata, manifest: &Path, out: &Path) -> Result<PathBuf, String> {
+    let bin = cargo_build(manifest, &meta.crate_name, false)?;
+    let out = if out.is_absolute() {
+        out.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(out)
+    };
+    let _ = std::fs::remove_file(&out);
+    let status = Command::new(&bin)
+        .env("UI_GEN_TS", &out)
+        .status()
+        .map_err(|e| format!("run {}: {e}", bin.display()))?;
+    if !status.success() || !out.exists() {
+        return Err(format!(
+            "{} didn't write {}: call `ui::write_typescript_if_requested(..)` at the start of main",
+            bin.display(),
+            out.display()
+        ));
+    }
+    Ok(out)
+}
+
 fn shell(cmd: &str, cwd: &Path) -> Result<Child, String> {
     let mut c = if cfg!(windows) {
         let mut c = Command::new("cmd");

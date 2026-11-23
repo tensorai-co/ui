@@ -8,6 +8,8 @@ pub(crate) mod macos_notify;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_objc;
 #[cfg(target_os = "macos")]
+pub(crate) mod macos_security;
+#[cfg(target_os = "macos")]
 pub(crate) mod macos_webkit;
 
 #[cfg(feature = "cef")]
@@ -1538,6 +1540,29 @@ impl Runtime {
                 if let Some(state) = self.call_state(id, call_id) {
                     state.push_inbound(data);
                 }
+            }
+            ClientSendPacket::FileDrop(at) => {
+                // CEF only reports paths when a drag enters; pair them with
+                // the page's drop. WebKit reports drops natively.
+                #[cfg(feature = "cef")]
+                if self.engine == EngineKind::Cef {
+                    let paths = cef::take_drag_paths(id);
+                    if !paths.is_empty() {
+                        let coord = |k: &str| {
+                            at.get(k)
+                                .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
+                                .unwrap_or(0.0)
+                        };
+                        let ev = WebViewEvent::FileDrop {
+                            paths,
+                            x: coord("x"),
+                            y: coord("y"),
+                        };
+                        self.handle_webview_event(id, ev);
+                    }
+                }
+                #[cfg(not(feature = "cef"))]
+                let _ = at;
             }
             ClientSendPacket::Event(name, data) => {
                 if let Some(handler) = snap.events.get(&name) {
