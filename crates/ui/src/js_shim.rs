@@ -26,6 +26,7 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
   const RPC_FLAG_STREAM = 0x02;
   const STREAM_DATA_PREFIX = "__ui_stream:";
   const STREAM_END_PREFIX = "__ui_stream_end:";
+  const STREAM_OPEN_PREFIX = "__ui_stream_open:";
 
   const enc = new TextEncoder();
   const dec = new TextDecoder();
@@ -33,6 +34,10 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
   const pendingFallback = new Map();
   let nextFallbackId = 1;
   let nextCallId = 1;
+  let lastPointer = { x: 0, y: 0 };
+  const notePointer = (ev) => { lastPointer = { x: ev.clientX, y: ev.clientY }; };
+  window.addEventListener("mousedown", notePointer, true);
+  window.addEventListener("contextmenu", notePointer, true);
   let hasAnyListener = false;
   let draining = false;
   let wakeAgain = false;
@@ -295,8 +300,22 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
     const callId = nextCallId++;
     const dataCh = STREAM_DATA_PREFIX + callId;
     const endCh = STREAM_END_PREFIX + callId;
+    const openCh = STREAM_OPEN_PREFIX + callId;
     const dataListeners = new Set();
     let done = false;
+    // Writes and close() wait until Rust has registered the stream, so they
+    // can't reach the host ahead of the open request.
+    let opened = false;
+    const pending = [];
+    const post = (pkt) => {
+      if (opened) sendPacket(pkt);
+      else pending.push(pkt);
+    };
+    const offOpen = api.on(openCh, () => {
+      opened = true;
+      offOpen();
+      for (const pkt of pending.splice(0)) sendPacket(pkt);
+    });
     let resolveClosed, rejectClosed;
     const closed = new Promise((res, rej) => { resolveClosed = res; rejectClosed = rej; });
     // Unobserved rejections of `closed` should not be reported as unhandled.
@@ -310,6 +329,8 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
       done = true;
       offData();
       offEnd();
+      offOpen();
+      pending.length = 0;
       dataListeners.clear();
     };
     const offEnd = api.on(endCh, (end) => {
@@ -336,11 +357,11 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
       },
       send(...data) {
         if (done) return;
-        sendPacket(encodeCallPacket(SEND_OP_STREAM_DATA, callId, packArgs(data)));
+        post(encodeCallPacket(SEND_OP_STREAM_DATA, callId, packArgs(data)));
       },
       close() {
         if (done) return;
-        sendPacket(encodeCallPacket(SEND_OP_CANCEL, callId));
+        post(encodeCallPacket(SEND_OP_CANCEL, callId));
       }
     });
   }
@@ -540,6 +561,13 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
       };
       wrapper._ipcOrig = fn;
       return api.on(key, wrapper);
+    },
+    // A native context menu; resolves to the chosen id, or null when dismissed.
+    // Items: "-" or { id, label, shortcut?, enabled?, checked?, danger?, items? }.
+    // Without a position it opens at the last pointer press.
+    contextMenu(items, pos) {
+      const at = pos || lastPointer;
+      return api.invoke("ui:contextMenu", { items, x: at.x, y: at.y });
     },
     window: Object.freeze({
       // "light" | "dark" | "system": the native window's appearance.

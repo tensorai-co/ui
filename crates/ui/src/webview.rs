@@ -679,6 +679,12 @@ impl WebViewBuilder {
         self
     }
 
+    /// Exposes the standard page calls (`ui.app`, `ui.dialog`, `ui.clipboard`,
+    /// `ui.window`, `ui.notify` in `ui-client`) for the groups `rpcs` allows.
+    pub fn standard_rpcs(self, rpcs: crate::standard::StandardRpcs) -> Self {
+        crate::standard::install(self, rpcs)
+    }
+
     fn insert_rpc(&mut self, name: String, kind: RpcKind, func: RpcFn) {
         self.spec.rpcs.insert(
             name,

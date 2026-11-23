@@ -1,0 +1,20 @@
+{
+  "name": "ui-client",
+  "version": "0.1.0",
+  "description": "Typed client for ui's window.ipc and standard page calls",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "files": ["index.js", "index.d.ts"],
+  "sideEffects": false,
+  "license": "Apache-2.0",
+  "scripts": {
+    "test": "node --test test/"
+  }
+}

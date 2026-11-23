@@ -294,6 +294,18 @@ impl Window {
         self.runtime.set_window_theme(self.id, theme);
     }
 
+    /// Shows a native context menu at `(x, y)`, in points from the top-left of
+    /// the window's content area, and returns the chosen item's id (or `None`
+    /// when dismissed). Blocks until the menu closes, like a native menu.
+    pub fn popup_menu(
+        &self,
+        items: Vec<crate::menu::ContextMenuItem>,
+        x: f64,
+        y: f64,
+    ) -> Option<String> {
+        self.runtime.popup_menu(self.id, items, x, y)
+    }
+
     /// Starts a native OS window drag using the current pointer event.
     pub fn begin_drag(&self) {
         self.runtime.begin_window_drag(self.id);

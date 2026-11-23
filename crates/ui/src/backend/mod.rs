@@ -19,14 +19,14 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use crate::app::App;
-use crate::call::CallState;
+use crate::call::{CallState, STREAM_OPEN_PREFIX};
 use crate::dialog::{FileDialogKind, FileDialogSpec, MessageDialogSpec, MessageResult};
 use crate::event::{Event, WebViewEvent, WindowEvent};
 use crate::ipc::{
     CallSpec, ClientSendPacket, Value, decode_base64, decode_rpc_request, decode_send_packet, encode_base64,
     encode_event_batch, encode_event_frame, encode_rpc_response, parse,
 };
-use crate::menu::{Menu, MenuItemUpdate, Role};
+use crate::menu::{ContextMenuItem, Menu, MenuItemUpdate, Role};
 use crate::platform::{RawWebViewHandle, RawWindowHandle};
 use crate::webview::{
     Ctx, EventHandler, LoadState, Response, RpcHandler, RpcKind, RpcOutcome, WebView, WebViewEventHandler, WebViewId,
@@ -351,6 +351,7 @@ pub(crate) fn next_zoom_step(current: f64, zoom_in: bool) -> f64 {
 const BUILTIN_MENU_SET: &str = "ui:menu.set";
 const BUILTIN_CHROME: &str = "ui:chrome";
 const BUILTIN_SET_THEME: &str = "ui:window.setTheme";
+const BUILTIN_CONTEXT_MENU: &str = "ui:contextMenu";
 /// Event the shim turns into `--ui-*` CSS variables and `data-ui-*` attributes.
 const CHROME_EVENT: &str = "__ui_chrome";
 
@@ -413,7 +414,7 @@ impl Runtime {
         self.wake();
     }
 
-    fn call_main_sync<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> T {
+    pub(crate) fn call_main_sync<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> T {
         if self.is_main() {
             return f();
         }
@@ -473,6 +474,70 @@ impl Runtime {
                 "open_external not implemented on this OS yet",
             ))
         }
+    }
+
+    pub fn app_info(self: &Arc<Self>) -> crate::app::AppInfo {
+        self.call_main_sync(|| {
+            #[cfg(target_os = "macos")]
+            {
+                crate::app::AppInfo {
+                    name: macos_appkit::app_name(),
+                    version: macos_appkit::bundle_version(),
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                crate::app::AppInfo {
+                    name: std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+                        .unwrap_or_default(),
+                    version: None,
+                }
+            }
+        })
+    }
+
+    pub fn popup_menu(
+        self: &Arc<Self>,
+        win_id: WindowId,
+        items: Vec<ContextMenuItem>,
+        x: f64,
+        y: f64,
+    ) -> Option<String> {
+        self.call_main_sync(move || {
+            #[cfg(target_os = "macos")]
+            {
+                macos_appkit::popup_context_menu(win_id, &items, x, y)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (win_id, items, x, y);
+                None
+            }
+        })
+    }
+
+    pub fn clipboard_text(self: &Arc<Self>) -> Option<String> {
+        self.call_main_sync(|| {
+            #[cfg(target_os = "macos")]
+            {
+                macos_appkit::clipboard_text()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                None
+            }
+        })
+    }
+
+    pub fn set_clipboard_text(self: &Arc<Self>, text: String) {
+        self.call_main_sync(move || {
+            #[cfg(target_os = "macos")]
+            macos_appkit::set_clipboard_text(&text);
+            #[cfg(not(target_os = "macos"))]
+            let _ = text;
+        });
     }
 
     pub fn app_theme(self: &Arc<Self>) -> Theme {
@@ -1387,6 +1452,24 @@ impl Runtime {
             };
             return reply(responder, update());
         }
+        if method == BUILTIN_CONTEXT_MENU {
+            let items = match arg.get("items").map(ContextMenuItem::from_page) {
+                Some(Ok(items)) => items,
+                Some(Err(e)) => return reply(responder, Err(e)),
+                None => return reply(responder, Err("contextMenu needs items".into())),
+            };
+            // Page CSS pixels to window points.
+            let zoom = self.webview_zoom(id);
+            let coord = |k: &str| {
+                arg.get(k)
+                    .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
+                    .unwrap_or(0.0)
+                    * zoom
+            };
+            let (x, y) = (coord("x"), coord("y"));
+            let chosen = self.popup_menu(snap.window_id, items, x, y);
+            return reply(responder, Ok(chosen.map_or(Value::Null, Value::String)));
+        }
         if method == BUILTIN_CHROME {
             return reply(responder, Ok(self.chrome_value(snap.window_id)));
         }
@@ -1441,6 +1524,11 @@ impl Runtime {
             && let Ok(mut calls) = self.calls.lock()
         {
             calls.insert(key, Arc::clone(st));
+        }
+        if handler.kind == RpcKind::Stream
+            && let Some((_, call_id)) = key
+        {
+            self.webview_emit(id, format!("{STREAM_OPEN_PREFIX}{call_id}"), Value::Null);
         }
         let rt = Arc::clone(self);
         // The responder is finished on the UI thread: WebKit scheme tasks live there.

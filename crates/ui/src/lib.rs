@@ -7,19 +7,23 @@ pub mod embed;
 pub mod error;
 pub mod event;
 pub mod ipc;
+#[cfg(target_os = "macos")]
+pub mod macos;
 pub mod menu;
 pub mod platform;
+pub mod standard;
 pub mod webview;
 pub mod window;
 
 mod backend;
 mod js_shim;
 
-pub use app::{App, SingleInstance, run};
+pub use app::{App, AppInfo, SingleInstance, run};
 pub use call::Stream;
 pub use dialog::Dialog;
 pub use error::{Error, Result};
 pub use ipc::{Bytes, DecodeError, FromIpc, IntoIpc, RpcResult, Value};
 pub use menu::Menu;
+pub use standard::StandardRpcs;
 pub use webview::{Ctx, Nav, NavRequest, Profile, Request, Response, WebView};
 pub use window::{Backdrop, Tabbing, TitleBar, Window};

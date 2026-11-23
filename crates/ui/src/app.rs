@@ -41,6 +41,21 @@ impl App {
         self.runtime.open_external(url)
     }
 
+    /// The app's display name and, when bundled, its version.
+    pub fn info(&self) -> AppInfo {
+        self.runtime.app_info()
+    }
+
+    /// Plain text on the system clipboard.
+    pub fn clipboard_text(&self) -> Option<String> {
+        self.runtime.clipboard_text()
+    }
+
+    /// Replaces the system clipboard with plain text.
+    pub fn set_clipboard_text(&self, text: &str) {
+        self.runtime.set_clipboard_text(text.to_owned());
+    }
+
     pub fn theme(&self) -> Theme {
         self.runtime.app_theme()
     }
@@ -152,4 +167,11 @@ impl Drop for SingleInstance {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// The app's name (`CFBundleName` or the process name) and bundle version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppInfo {
+    pub name: String,
+    pub version: Option<String>,
 }

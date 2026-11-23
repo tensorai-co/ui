@@ -126,6 +126,12 @@ impl FileDialog {
         self
     }
 
+    /// Adds filters built at runtime (for example from a page's request).
+    pub fn filters(mut self, filters: impl IntoIterator<Item = Filter>) -> Self {
+        self.spec.filters.extend(filters);
+        self
+    }
+
     pub fn pick_file(self) -> Option<PathBuf> {
         self.runtime
             .run_file_dialog(self.window, FileDialogKind::OpenFile, self.spec)

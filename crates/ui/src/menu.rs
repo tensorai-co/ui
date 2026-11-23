@@ -465,6 +465,158 @@ impl std::fmt::Debug for MenuItemHandle {
     }
 }
 
+impl Shortcut {
+    /// Parses a shortcut written like `"Cmd+Shift+K"`, `"Ctrl+`"`, `"F2"` or
+    /// `"Alt+Backspace"`. `Cmd`/`Primary` mean Cmd on macOS and Ctrl elsewhere.
+    pub fn parse(text: &str) -> Option<Self> {
+        let parts: Vec<&str> = text.split('+').map(str::trim).collect();
+        // "Cmd++" ends with an empty part: the key is "+".
+        let (key, mods) = match parts.as_slice() {
+            [.., a, b] if a.is_empty() && b.is_empty() => ("+", &parts[..parts.len() - 2]),
+            [mods @ .., key] if !key.is_empty() => (*key, mods),
+            _ => return None,
+        };
+        let mut m = Mod::NONE;
+        for part in mods {
+            m = m | match part.to_ascii_lowercase().as_str() {
+                "cmd" | "command" | "primary" | "cmdorctrl" => Mod::PRIMARY,
+                "shift" => Mod::SHIFT,
+                "alt" | "option" | "opt" => Mod::ALT,
+                "ctrl" | "control" => Mod::CTRL,
+                "meta" | "super" | "win" => Mod::META,
+                _ => return None,
+            };
+        }
+        Some(Self::new(m, key))
+    }
+}
+
+/// One entry of a native context menu (see [`Window::popup_menu`](crate::Window::popup_menu)
+/// and `ipc.contextMenu` / `ui.contextMenu` in JS).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextMenuItem {
+    Item {
+        id: String,
+        label: String,
+        /// Shown next to the label, e.g. `Shortcut::parse("F2")`.
+        shortcut: Option<Shortcut>,
+        enabled: bool,
+        checked: bool,
+        /// Destructive action, drawn in red.
+        danger: bool,
+        /// Non-empty for a submenu.
+        items: Vec<ContextMenuItem>,
+    },
+    Separator,
+}
+
+impl ContextMenuItem {
+    pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
+        Self::Item {
+            id: id.into(),
+            label: label.into(),
+            shortcut: None,
+            enabled: true,
+            checked: false,
+            danger: false,
+            items: Vec::new(),
+        }
+    }
+
+    pub fn separator() -> Self {
+        Self::Separator
+    }
+
+    fn with(mut self, f: impl FnOnce(&mut Self)) -> Self {
+        f(&mut self);
+        self
+    }
+
+    pub fn shortcut(self, sc: Shortcut) -> Self {
+        self.with(|i| {
+            if let Self::Item { shortcut, .. } = i {
+                *shortcut = Some(sc);
+            }
+        })
+    }
+
+    pub fn enabled(self, on: bool) -> Self {
+        self.with(|i| {
+            if let Self::Item { enabled, .. } = i {
+                *enabled = on;
+            }
+        })
+    }
+
+    pub fn checked(self, on: bool) -> Self {
+        self.with(|i| {
+            if let Self::Item { checked, .. } = i {
+                *checked = on;
+            }
+        })
+    }
+
+    pub fn danger(self) -> Self {
+        self.with(|i| {
+            if let Self::Item { danger, .. } = i {
+                *danger = true;
+            }
+        })
+    }
+
+    pub fn submenu(self, children: Vec<ContextMenuItem>) -> Self {
+        self.with(|i| {
+            if let Self::Item { items, .. } = i {
+                *items = children;
+            }
+        })
+    }
+
+    /// Reads the page's description: `"-"` is a separator, objects are
+    /// `{ id, label, shortcut?, enabled?, checked?, danger?, items? }`.
+    pub(crate) fn from_page(value: &crate::ipc::Value) -> Result<Vec<Self>, String> {
+        use crate::ipc::Value;
+        let Value::Array(list) = value else {
+            return Err("contextMenu expects an array of items".into());
+        };
+        list.iter()
+            .map(|v| match v {
+                Value::String(s) if s == "-" => Ok(Self::Separator),
+                Value::Object(_) => {
+                    let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
+                    let flag = |k: &str, d: bool| v.get(k).and_then(Value::as_bool).unwrap_or(d);
+                    let label = text("label").ok_or("context menu item needs a \"label\"")?;
+                    let items = match v.get("items") {
+                        Some(sub) if !matches!(sub, Value::Null) => Self::from_page(sub)?,
+                        _ => Vec::new(),
+                    };
+                    let id = match text("id") {
+                        Some(id) => id,
+                        None if !items.is_empty() => String::new(),
+                        None => return Err(format!("context menu item \"{label}\" needs an \"id\"")),
+                    };
+                    let shortcut = match text("shortcut") {
+                        Some(s) => Some(
+                            Shortcut::parse(&s).ok_or_else(|| format!("bad shortcut \"{s}\""))?,
+                        ),
+                        None => None,
+                    };
+                    Ok(Self::Item {
+                        id,
+                        label,
+                        shortcut,
+                        enabled: flag("enabled", true),
+                        checked: flag("checked", false),
+                        danger: flag("danger", false),
+                        items,
+                    })
+                }
+                _ => Err("context menu items are objects or \"-\"".into()),
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,6 +629,41 @@ mod tests {
                 MenuItem::Separator => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn shortcut_parsing() {
+        assert_eq!(Shortcut::parse("F2"), Some(Shortcut::new(Mod::NONE, "F2")));
+        assert_eq!(Shortcut::parse("Cmd+Shift+K"), Some(Shortcut::cmd_shift("K")));
+        assert_eq!(Shortcut::parse("ctrl + `"), Some(Shortcut::ctrl("`")));
+        assert_eq!(Shortcut::parse("Cmd++"), Some(Shortcut::cmd("+")));
+        assert_eq!(Shortcut::parse("Hyper+K"), None);
+        assert_eq!(Shortcut::parse(""), None);
+        assert_eq!(Shortcut::parse("Cmd+"), None);
+    }
+
+    #[test]
+    fn context_menu_from_page() {
+        let v = crate::json!([
+            { "id": "rename", "label": "Rename", "shortcut": "F2" },
+            "-",
+            { "label": "Move to", "items": [{ "id": "a", "label": "A", "checked": true }] },
+            { "id": "delete", "label": "Delete", "danger": true, "enabled": false }
+        ]);
+        let items = ContextMenuItem::from_page(&v).unwrap();
+        assert_eq!(items.len(), 4);
+        assert_eq!(
+            items[0],
+            ContextMenuItem::new("rename", "Rename").shortcut(Shortcut::new(Mod::NONE, "F2"))
+        );
+        assert_eq!(items[1], ContextMenuItem::Separator);
+        let ContextMenuItem::Item { items: sub, .. } = &items[2] else { panic!() };
+        assert_eq!(sub[0], ContextMenuItem::new("a", "A").checked(true));
+        assert_eq!(items[3], ContextMenuItem::new("delete", "Delete").danger().enabled(false));
+
+        assert!(ContextMenuItem::from_page(&crate::json!({})).is_err());
+        assert!(ContextMenuItem::from_page(&crate::json!([{ "label": "No id" }])).is_err());
+        assert!(ContextMenuItem::from_page(&crate::json!([{ "id": "x", "label": "X", "shortcut": "Hyper+K" }])).is_err());
     }
 
     #[test]

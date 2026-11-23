@@ -18,7 +18,7 @@ use crate::dialog::{
     FileDialogKind, FileDialogSpec, MessageButtons, MessageDialogSpec, MessageLevel, MessageResult,
 };
 use crate::event::{Event, WindowEvent};
-use crate::menu::{Menu, MenuItem, MenuItemUpdate, Mod, Role};
+use crate::menu::{ContextMenuItem, Menu, MenuItem, MenuItemUpdate, Mod, Role, Shortcut};
 use crate::window::{
     Backdrop, Bounds, Display, Tabbing, Theme, TitleBar, WindowId, WindowSpec, WindowState,
 };
@@ -44,6 +44,11 @@ thread_local! {
     static MENU_HANDLERS: RefCell<HashMap<isize, CustomMenuAction>> = RefCell::new(HashMap::new());
     /// Every built item by id (retained) with its tag, for `MenuItemHandle` updates.
     static MENU_ITEMS_BY_ID: RefCell<HashMap<String, (Id, isize)>> = RefCell::new(HashMap::new());
+    /// Tags owned by the app menu, cleared when it is rebuilt (the Dock menu keeps its own).
+    static APP_MENU_TAGS: RefCell<Vec<isize>> = const { RefCell::new(Vec::new()) };
+    static DOCK_MENU_TAGS: RefCell<Vec<isize>> = const { RefCell::new(Vec::new()) };
+    /// The Dock menu returned from `applicationDockMenu:` (retained), or nil.
+    static DOCK_MENU: RefCell<Id> = const { RefCell::new(NIL) };
     static NEXT_MENU_TAG: RefCell<isize> = const { RefCell::new(1000) };
     static MENU_TARGET: RefCell<Id> = const { RefCell::new(NIL) };
     static LAST_LEFT_DOWN: RefCell<HashMap<usize, Id>> = RefCell::new(HashMap::new());
@@ -238,6 +243,10 @@ extern "C" fn window_did_become_key(_: Id, _: Sel, notification: Id) {
     }
 }
 
+extern "C" fn app_dock_menu(_: Id, _: Sel, _: Id) -> Id {
+    DOCK_MENU.with(|m| *m.borrow())
+}
+
 fn push_fullscreen_event(notification: Id, fullscreen: bool) {
     let ns_win = msg!(Id; notification, "object");
     if let Some(id) = NS_TO_WINDOW_ID.with(|m| m.borrow().get(&(ns_win as usize)).copied())
@@ -349,6 +358,11 @@ fn ensure_classes() -> (Id, Id, Id, Id) {
                     "applicationShouldTerminateAfterLastWindowClosed:",
                     should_terminate_after_last_window as *const c_void,
                     &format!("{BOOL_ENC}@:@"),
+                ),
+                (
+                    "applicationDockMenu:",
+                    app_dock_menu as *const c_void,
+                    "@@:@",
                 ),
                 (
                     "applicationShouldHandleReopen:hasVisibleWindows:",
@@ -1111,6 +1125,38 @@ pub(crate) fn app_name() -> String {
     rust_string(msg!(Id; info, "processName"))
 }
 
+/// `CFBundleShortVersionString` when running from a bundle.
+pub(crate) fn bundle_version() -> Option<String> {
+    let bundle = msg!(Id; class("NSBundle"), "mainBundle");
+    if bundle.is_null() {
+        return None;
+    }
+    let v = msg!(Id; bundle, "objectForInfoDictionaryKey:", ns_string("CFBundleShortVersionString") => Id);
+    (!v.is_null() && msg!(bool; v, "isKindOfClass:", class("NSString") => Id))
+        .then(|| rust_string(v))
+        .filter(|s| !s.is_empty())
+}
+
+const PASTEBOARD_STRING: &str = "public.utf8-plain-text";
+
+pub(crate) fn clipboard_text() -> Option<String> {
+    let pb = msg!(Id; class("NSPasteboard"), "generalPasteboard");
+    if pb.is_null() {
+        return None;
+    }
+    let s = msg!(Id; pb, "stringForType:", ns_string(PASTEBOARD_STRING) => Id);
+    (!s.is_null()).then(|| rust_string(s))
+}
+
+pub(crate) fn set_clipboard_text(text: &str) {
+    let pb = msg!(Id; class("NSPasteboard"), "generalPasteboard");
+    if pb.is_null() {
+        return;
+    }
+    msg!(isize; pb, "clearContents");
+    msg!(bool; pb, "setString:forType:", ns_string(text) => Id, ns_string(PASTEBOARD_STRING) => Id);
+}
+
 /// Default role titles that read better with the app's name, as macOS apps do.
 pub(crate) fn role_title_with_app(role: Role, title: &str, app: &str) -> Option<String> {
     match (role, title) {
@@ -1164,7 +1210,15 @@ fn native_role_selector(role: Role) -> Option<&'static str> {
 
 pub(crate) fn set_app_menu(menu: &Menu) {
     let (_, _, _, target_cls) = ensure_classes();
-    MENU_HANDLERS.with(|h| h.borrow_mut().clear());
+    APP_MENU_TAGS.with(|t| {
+        let tags = std::mem::take(&mut *t.borrow_mut());
+        MENU_HANDLERS.with(|h| {
+            let mut h = h.borrow_mut();
+            for tag in tags {
+                h.remove(&tag);
+            }
+        });
+    });
     MENU_ITEMS_BY_ID.with(|m| {
         for (_, (item, _)) in m.borrow_mut().drain() {
             release(item);
@@ -1218,7 +1272,7 @@ pub(crate) fn set_app_menu(menu: &Menu) {
 
                     let key = shortcut
                         .as_ref()
-                        .map(|s| s.key.to_ascii_lowercase())
+                        .map(|s| ns_key_equivalent(&s.key))
                         .unwrap_or_default();
                     let native_sel = role.and_then(native_role_selector);
                     let command = match role {
@@ -1234,20 +1288,7 @@ pub(crate) fn set_app_menu(menu: &Menu) {
                         ns_string(&title) => Id, sel(action_sel) => Sel, ns_string(&key) => Id);
 
                     if let Some(sc) = shortcut {
-                        let mut mask = 0usize;
-                        if sc.mods.contains(Mod::PRIMARY) || sc.mods.contains(Mod::META) {
-                            mask |= MOD_COMMAND;
-                        }
-                        if sc.mods.contains(Mod::SHIFT) {
-                            mask |= MOD_SHIFT;
-                        }
-                        if sc.mods.contains(Mod::ALT) {
-                            mask |= MOD_OPTION;
-                        }
-                        if sc.mods.contains(Mod::CTRL) {
-                            mask |= MOD_CONTROL;
-                        }
-                        msg!((); ns_item, "setKeyEquivalentModifierMask:", mask => usize);
+                        msg!((); ns_item, "setKeyEquivalentModifierMask:", modifier_mask(sc) => usize);
                     }
                     msg!((); ns_item, "setEnabled:", *enabled => bool);
                     if *checked {
@@ -1268,6 +1309,7 @@ pub(crate) fn set_app_menu(menu: &Menu) {
                         });
                         msg!((); ns_item, "setTag:", tag => isize);
                         msg!((); ns_item, "setTarget:", menu_target => Id);
+                        APP_MENU_TAGS.with(|t| t.borrow_mut().push(tag));
                         tag
                     } else {
                         0
@@ -1297,6 +1339,292 @@ pub(crate) fn set_app_menu(menu: &Menu) {
     }
     msg!((); ns_app(), "setMainMenu:", main_menu => Id);
     release(main_menu);
+}
+
+fn modifier_mask(sc: &Shortcut) -> usize {
+    let mut mask = 0usize;
+    if sc.mods.contains(Mod::PRIMARY) || sc.mods.contains(Mod::META) {
+        mask |= MOD_COMMAND;
+    }
+    if sc.mods.contains(Mod::SHIFT) {
+        mask |= MOD_SHIFT;
+    }
+    if sc.mods.contains(Mod::ALT) {
+        mask |= MOD_OPTION;
+    }
+    if sc.mods.contains(Mod::CTRL) {
+        mask |= MOD_CONTROL;
+    }
+    mask
+}
+
+/// `NSMenuItem.keyEquivalent` for a shortcut key name: function, arrow and
+/// editing keys map to their AppKit characters, single characters are lowercased.
+pub(crate) fn ns_key_equivalent(key: &str) -> String {
+    let lower = key.to_ascii_lowercase();
+    let named = match lower.as_str() {
+        "backspace" => Some('\u{8}'),
+        "delete" | "del" => Some('\u{7f}'),
+        "enter" | "return" => Some('\r'),
+        "escape" | "esc" => Some('\u{1b}'),
+        "tab" => Some('\t'),
+        "space" => Some(' '),
+        "up" => Some('\u{F700}'),
+        "down" => Some('\u{F701}'),
+        "left" => Some('\u{F702}'),
+        "right" => Some('\u{F703}'),
+        _ => None,
+    };
+    if let Some(c) = named {
+        return c.to_string();
+    }
+    if let Some(n) = lower.strip_prefix('f').and_then(|n| n.parse::<u32>().ok())
+        && (1..=20).contains(&n)
+        && let Some(c) = char::from_u32(0xF704 + n - 1)
+    {
+        return c.to_string();
+    }
+    lower
+}
+
+/// Builds an `NSMenu` for a context menu; chosen items write their id into `choice`.
+fn build_context_menu(
+    items: &[ContextMenuItem],
+    target: Id,
+    choice: &Arc<Mutex<Option<String>>>,
+    tags: &mut Vec<isize>,
+) -> Id {
+    let menu = msg!(Id; msg!(Id; class("NSMenu"), "alloc"), "initWithTitle:", ns_string("") => Id);
+    msg!((); menu, "setAutoenablesItems:", false => bool);
+    for item in items {
+        match item {
+            ContextMenuItem::Separator => {
+                let sep = msg!(Id; class("NSMenuItem"), "separatorItem");
+                msg!((); menu, "addItem:", sep => Id);
+            }
+            ContextMenuItem::Item {
+                id,
+                label,
+                shortcut,
+                enabled,
+                checked,
+                danger,
+                items: children,
+            } => {
+                let key = shortcut
+                    .as_ref()
+                    .map(|s| ns_key_equivalent(&s.key))
+                    .unwrap_or_default();
+                let ns_item = msg!(Id; msg!(Id; class("NSMenuItem"), "alloc"), "initWithTitle:action:keyEquivalent:",
+                    ns_string(label) => Id, sel("onCustomMenuItem:") => Sel, ns_string(&key) => Id);
+                if let Some(sc) = shortcut {
+                    msg!((); ns_item, "setKeyEquivalentModifierMask:", modifier_mask(sc) => usize);
+                }
+                msg!((); ns_item, "setEnabled:", *enabled => bool);
+                if *checked {
+                    msg!((); ns_item, "setState:", 1isize => isize);
+                }
+                if *danger {
+                    let red = msg!(Id; class("NSColor"), "systemRedColor");
+                    let attrs = msg!(Id; class("NSDictionary"), "dictionaryWithObject:forKey:",
+                        red => Id, ns_string("NSColor") => Id);
+                    let title = msg!(Id; msg!(Id; class("NSAttributedString"), "alloc"),
+                        "initWithString:attributes:", ns_string(label) => Id, attrs => Id);
+                    msg!((); ns_item, "setAttributedTitle:", title => Id);
+                    release(title);
+                }
+                if children.is_empty() {
+                    let tag = next_menu_tag();
+                    let choice = Arc::clone(choice);
+                    let id = id.clone();
+                    MENU_HANDLERS.with(|h| {
+                        h.borrow_mut().insert(
+                            tag,
+                            CustomMenuAction {
+                                handler: Some(Arc::new(move || {
+                                    *choice.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        Some(id.clone());
+                                })),
+                                command: None,
+                                enabled: true,
+                            },
+                        )
+                    });
+                    tags.push(tag);
+                    msg!((); ns_item, "setTag:", tag => isize);
+                    msg!((); ns_item, "setTarget:", target => Id);
+                } else {
+                    let sub = build_context_menu(children, target, choice, tags);
+                    msg!((); ns_item, "setSubmenu:", sub => Id);
+                    release(sub);
+                }
+                msg!((); menu, "addItem:", ns_item => Id);
+                release(ns_item);
+            }
+        }
+    }
+    menu
+}
+
+/// Shows a context menu at `(x, y)` (points from the content area's top-left)
+/// and returns the chosen item's id once it closes, or `None` if dismissed.
+pub(crate) fn popup_context_menu(
+    win_id: WindowId,
+    items: &[ContextMenuItem],
+    x: f64,
+    y: f64,
+) -> Option<String> {
+    let (_, _, _, target_cls) = ensure_classes();
+    let target = MENU_TARGET.with(|slot| {
+        let mut s = slot.borrow_mut();
+        if s.is_null() {
+            *s = retain(msg!(Id; msg!(Id; target_cls, "alloc"), "init"));
+        }
+        *s
+    });
+    let content = WINDOW_RECORDS.with(|r| r.borrow().get(&win_id).map(|rec| rec.content_view))?;
+    let choice = Arc::new(Mutex::new(None));
+    let mut tags = Vec::new();
+    let menu = build_context_menu(items, target, &choice, &mut tags);
+    let bounds = rect_of(content, "bounds");
+    let flipped = msg!(bool; content, "isFlipped");
+    let at = Point {
+        x,
+        y: if flipped { y } else { bounds.size.height - y },
+    };
+    msg!(bool; menu, "popUpMenuPositioningItem:atLocation:inView:", NIL => Id, at => Point, content => Id);
+    release(menu);
+    MENU_HANDLERS.with(|h| {
+        let mut h = h.borrow_mut();
+        for tag in tags {
+            h.remove(&tag);
+        }
+    });
+    choice.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+// ---------------------------------------------------------------------------
+// Dock tile
+// ---------------------------------------------------------------------------
+
+/// Sets the Dock icon from `.icns` / `.png` / `.jpg` bytes. Returns false if
+/// AppKit can't decode them.
+pub(crate) fn dock_set_icon(bytes: &[u8]) -> bool {
+    let data = msg!(Id; class("NSData"), "dataWithBytes:length:",
+        bytes.as_ptr() as *const c_void => *const c_void, bytes.len() => usize);
+    if data.is_null() {
+        return false;
+    }
+    let image = msg!(Id; msg!(Id; class("NSImage"), "alloc"), "initWithData:", data => Id);
+    if image.is_null() {
+        return false;
+    }
+    msg!((); ns_app(), "setApplicationIconImage:", image => Id);
+    release(image);
+    true
+}
+
+pub(crate) fn dock_reset_icon() {
+    msg!((); ns_app(), "setApplicationIconImage:", NIL => Id);
+}
+
+pub(crate) fn dock_set_badge(label: Option<&str>) {
+    let tile = msg!(Id; ns_app(), "dockTile");
+    if tile.is_null() {
+        return;
+    }
+    let value = label.filter(|l| !l.is_empty()).map_or(NIL, ns_string);
+    msg!((); tile, "setBadgeLabel:", value => Id);
+}
+
+pub(crate) fn dock_badge() -> Option<String> {
+    let tile = msg!(Id; ns_app(), "dockTile");
+    if tile.is_null() {
+        return None;
+    }
+    let v = msg!(Id; tile, "badgeLabel");
+    (!v.is_null()).then(|| rust_string(v)).filter(|s| !s.is_empty())
+}
+
+/// `requestUserAttention:`; returns the request id (0 when the app is already active).
+pub(crate) fn dock_bounce(critical: bool) -> isize {
+    // NSCriticalRequest = 0, NSInformationalRequest = 10.
+    let kind: usize = if critical { 0 } else { 10 };
+    msg!(isize; ns_app(), "requestUserAttention:", kind => usize)
+}
+
+pub(crate) fn dock_cancel_bounce(request: isize) {
+    msg!((); ns_app(), "cancelUserAttentionRequest:", request => isize);
+}
+
+/// Replaces the menu shown when the Dock icon is right-clicked. Items with
+/// `.on_click` or `.emit()` work as in the app menu; an empty list removes it.
+pub(crate) fn set_dock_menu(items: &[MenuItem]) {
+    let (_, _, _, target_cls) = ensure_classes();
+    DOCK_MENU_TAGS.with(|t| {
+        let tags = std::mem::take(&mut *t.borrow_mut());
+        MENU_HANDLERS.with(|h| {
+            let mut h = h.borrow_mut();
+            for tag in tags {
+                h.remove(&tag);
+            }
+        });
+    });
+    let old = DOCK_MENU.with(|m| std::mem::replace(&mut *m.borrow_mut(), NIL));
+    if !old.is_null() {
+        release(old);
+    }
+    if items.is_empty() {
+        return;
+    }
+    let target = MENU_TARGET.with(|slot| {
+        let mut s = slot.borrow_mut();
+        if s.is_null() {
+            *s = retain(msg!(Id; msg!(Id; target_cls, "alloc"), "init"));
+        }
+        *s
+    });
+    let menu = msg!(Id; msg!(Id; class("NSMenu"), "alloc"), "initWithTitle:", ns_string("Dock") => Id);
+    for item in items {
+        match item {
+            MenuItem::Separator => {
+                let sep = msg!(Id; class("NSMenuItem"), "separatorItem");
+                msg!((); menu, "addItem:", sep => Id);
+            }
+            MenuItem::Action {
+                id,
+                title,
+                enabled,
+                checked,
+                emit,
+                handler,
+                ..
+            } => {
+                let ns_item = msg!(Id; msg!(Id; class("NSMenuItem"), "alloc"), "initWithTitle:action:keyEquivalent:",
+                    ns_string(title) => Id, sel("onCustomMenuItem:") => Sel, ns_string("") => Id);
+                if *checked {
+                    msg!((); ns_item, "setState:", 1isize => isize);
+                }
+                let tag = next_menu_tag();
+                MENU_HANDLERS.with(|h| {
+                    h.borrow_mut().insert(
+                        tag,
+                        CustomMenuAction {
+                            handler: handler.clone(),
+                            command: emit.then(|| MenuCommand::Emit(id.clone())),
+                            enabled: *enabled,
+                        },
+                    )
+                });
+                DOCK_MENU_TAGS.with(|t| t.borrow_mut().push(tag));
+                msg!((); ns_item, "setTag:", tag => isize);
+                msg!((); ns_item, "setTarget:", target => Id);
+                msg!((); menu, "addItem:", ns_item => Id);
+                release(ns_item);
+            }
+        }
+    }
+    DOCK_MENU.with(|m| *m.borrow_mut() = menu);
 }
 
 /// Applies a `MenuItemHandle` / `ipc.menu.set` change to the built menu.
@@ -1506,4 +1834,60 @@ pub(crate) fn run_message_dialog(
 
 pub(crate) fn set_key_value_bool(obj: Id, key: &str, val: bool) {
     msg!((); obj, "setValue:forKey:", ns_number_bool(val) => Id, ns_string(key) => Id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_equivalents_for_named_keys() {
+        assert_eq!(ns_key_equivalent("K"), "k");
+        assert_eq!(ns_key_equivalent("F2"), "\u{F705}");
+        assert_eq!(ns_key_equivalent("Backspace"), "\u{8}");
+        assert_eq!(ns_key_equivalent("Up"), "\u{F700}");
+        assert_eq!(ns_key_equivalent("="), "=");
+        assert_eq!(ns_key_equivalent("F99"), "f99");
+    }
+
+    #[test]
+    fn context_menu_builds_native_items_and_reports_the_choice() {
+        let (_, _, _, target_cls) = ensure_classes();
+        let target = msg!(Id; msg!(Id; target_cls, "alloc"), "init");
+        let items = vec![
+            ContextMenuItem::new("rename", "Rename").shortcut(Shortcut::parse("F2").unwrap()),
+            ContextMenuItem::separator(),
+            ContextMenuItem::new("move", "Move to")
+                .submenu(vec![ContextMenuItem::new("a", "Folder A").checked(true)]),
+            ContextMenuItem::new("delete", "Delete")
+                .shortcut(Shortcut::parse("Cmd+Backspace").unwrap())
+                .danger()
+                .enabled(false),
+        ];
+        let choice = Arc::new(Mutex::new(None));
+        let mut tags = Vec::new();
+        let menu = build_context_menu(&items, target, &choice, &mut tags);
+
+        assert_eq!(msg!(isize; menu, "numberOfItems"), 4);
+        let item = |m: Id, i: isize| msg!(Id; m, "itemAtIndex:", i => isize);
+        let rename = item(menu, 0);
+        assert_eq!(rust_string(msg!(Id; rename, "title")), "Rename");
+        assert_eq!(rust_string(msg!(Id; rename, "keyEquivalent")), "\u{F705}");
+        assert!(msg!(bool; item(menu, 1), "isSeparatorItem"));
+        let sub = msg!(Id; item(menu, 2), "submenu");
+        assert!(!sub.is_null());
+        assert_eq!(msg!(isize; item(sub, 0), "state"), 1);
+        let delete = item(menu, 3);
+        assert!(!msg!(bool; delete, "isEnabled"));
+        assert!(!msg!(Id; delete, "attributedTitle").is_null());
+        assert_eq!(msg!(usize; delete, "keyEquivalentModifierMask"), MOD_COMMAND);
+        assert_eq!(tags.len(), 3, "one tag per leaf item");
+
+        // Choosing "Rename": AppKit sends the item's action to its target.
+        assert_eq!(msg!(Id; rename, "target"), target);
+        msg!((); target, "onCustomMenuItem:", rename => Id);
+        assert_eq!(choice.lock().unwrap().as_deref(), Some("rename"));
+        release(menu);
+        release(target);
+    }
 }

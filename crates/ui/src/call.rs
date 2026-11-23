@@ -10,6 +10,9 @@ use crate::{Error, Result};
 
 /// Event channel prefix for data the host writes into an open stream.
 pub(crate) const STREAM_DATA_PREFIX: &str = "__ui_stream:";
+/// Event channel prefix telling the page a stream is registered, so data and
+/// `close()` it sends from now on can't overtake the open request.
+pub(crate) const STREAM_OPEN_PREFIX: &str = "__ui_stream_open:";
 /// Event channel prefix for a stream's final `{ ok }` / `{ error }` frame.
 pub(crate) const STREAM_END_PREFIX: &str = "__ui_stream_end:";
 

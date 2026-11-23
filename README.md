@@ -104,6 +104,46 @@ html[data-ui-focused='false'] .sidebar { opacity: 0.7; }
 
 Also set: `--ui-window-controls-right`, `data-ui-platform` (`macos` / `windows` / `linux`) and `data-ui-theme` (`light` / `dark`, the window's effective appearance). `win.set_theme(Some(Theme::Light))`, or `ipc.window.setTheme("light" | "dark" | "system")` from the page, makes the window's vibrancy, controls and sheets follow the app's own theme setting instead of the system's.
 
+### Standard Page Calls & `ui-client`
+
+`.standard_rpcs(..)` exposes the calls every app otherwise writes itself, per group: `app` (`info`, `openExternal` for http/https/mailto only), `dialog` (file pickers, message and confirm sheets), `clipboard`, `window` and `notify`.
+
+```rust
+WebView::new().standard_rpcs(ui::StandardRpcs::all().version(env!("CARGO_PKG_VERSION")))
+// or: StandardRpcs::none().app().dialog()
+```
+
+The [`ui-client`](packages/ui-client) npm package (versioned with the crate) gives pages typed access to them and to `window.ipc`. In a plain browser `isNative()` is false and the helpers fall back to web APIs where one exists:
+
+```ts
+import { ipc, isNative, platform, ui } from "ui-client";
+
+const folder = await ui.dialog.pickFolder({ title: "Open Project" });
+if (await ui.dialog.confirm("Delete file?", "This can't be undone.")) { /* … */ }
+await ui.clipboard.writeText("copied");
+const choice = await ui.contextMenu([
+  { id: "rename", label: "Rename", shortcut: "F2" },
+  "-",
+  { id: "delete", label: "Delete", danger: true },
+]); // native NSMenu at the last pointer press; resolves to the id or null
+```
+
+### macOS Extensions (`ui::macos`)
+
+macOS-only features live in `ui::macos`, so using them on another OS is a compile error rather than a silent no-op:
+
+```rust
+use ui::macos::{AppExt, Attention};
+
+let dock = app.macos().dock();
+dock.set_icon(include_bytes!("../assets/AppIcon.icns"))?; // e.g. for an unbundled `cargo run`
+dock.set_badge("2");
+dock.bounce(Attention::Informational);
+dock.set_menu(vec![MenuItem::new("new_window", "New Window").emit()]);
+```
+
+Native context menus are also available from Rust: `window.popup_menu(vec![ContextMenuItem::new("rename", "Rename")], x, y)` returns the chosen id.
+
 ### Hosted URL App & Typed Commands
 
 ```rust
@@ -245,6 +285,9 @@ cargo run --features cef --example web_bundle
 cargo run --features cef --example url_app
 cargo test -p ui --test conformance --features cef
 
+# ui-client package tests
+(cd packages/ui-client && npm test)
+
 # Runtime backend selection when compiled with --features cef
 UI_BACKEND=webkit cargo test -p ui --test conformance --features cef
 ```
@@ -262,7 +305,9 @@ ui
 ├── webview    // WebView, WebViewBuilder, WebViewId, Ctx, Request, Response, Mime, Nav, NavRequest, Profile, LoadState
 ├── embed      // Embedded (+ embedded!), served with WebViewBuilder::bundle
 ├── ipc        // Bytes, Value, FromIpc, IntoIpc, DecodeError, RpcResult (+ json!, ipc_enum!, ipc_struct!)
-├── menu       // Menu, Submenu, MenuItem, MenuItemHandle, MenuItemUpdate, Role, Shortcut, Mod
+├── menu       // Menu, Submenu, MenuItem, MenuItemHandle, MenuItemUpdate, ContextMenuItem, Role, Shortcut, Mod
+├── standard   // StandardRpcs (ui.app / dialog / clipboard / window / notify page calls)
+├── macos      // AppExt, MacApp, Dock, Attention (macOS only)
 ├── dialog     // Dialog, FileDialog, MessageDialog, Filter, MessageLevel, MessageButtons, MessageResult
 ├── event      // Event, WindowEvent, WebViewEvent
 ├── platform   // RawWindowHandle, RawWebViewHandle
@@ -363,6 +408,8 @@ ui/
     ├── ui-build/               # build.rs helper: embeds a web build for ui::embedded!(), runs the web build
     ├── ui-cef-sys/             # cef.lock + Spotify CEF fetcher, C11 helper bundler, cef_api_hash check, raw C-API FFI
     └── ui-pack/                # .app / MAS entitlements assembler & MSIX / .desktop manifest generators
+packages/
+└── ui-client/                  # npm package: typed window.ipc, isNative/platform, ui.* standard calls
 examples/
 └── embedded-app/               # ui-build + ui::embedded!() app, with a live test of the bundle and UI_DEV_URL
 ```
