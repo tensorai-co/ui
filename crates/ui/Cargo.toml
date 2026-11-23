@@ -26,3 +26,7 @@ ui-cef-sys = { version = "0.1.0", path = "../ui-cef-sys" }
 [[test]]
 name = "conformance"
 harness = false
+
+[[test]]
+name = "macos_window"
+harness = false

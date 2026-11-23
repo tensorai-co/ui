@@ -126,6 +126,10 @@ export type WindowState = "normal" | "minimized" | "maximized" | "fullscreen";
 export const ui: {
   readonly app: {
     info(): Promise<AppInfo>;
+    /** A URL with one of the app's `url_schemes`, including one that launched the app. */
+    on(event: "open-url", fn: (url: string) => void): Unsubscribe;
+    /** Files opened with the app (Finder, Dock icon drop). */
+    on(event: "open-files", fn: (paths: string[]) => void): Unsubscribe;
     /** http, https and mailto URLs only. */
     openExternal(url: string): Promise<void>;
   };
@@ -149,6 +153,8 @@ export const ui: {
     setTitle(title: string): Promise<void>;
     state(): Promise<WindowState>;
     close(): Promise<void>;
+    /** Shows the unsaved-changes dot in the close button (macOS; no-op elsewhere). */
+    setDocumentEdited(edited: boolean): Promise<void>;
     setTheme(theme: Theme): Promise<void>;
   };
   readonly menu: {

@@ -48,3 +48,32 @@ test("inside a ui webview: wrappers call the standard RPC names", async () => {
   assert.deepEqual(calls.at(-1), ["custom", 1, 2]);
   delete globalThis.window;
 });
+
+test("ui.app.on replays URLs and files that arrived before the page", async () => {
+  const listeners = new Map();
+  let takes = 0;
+  globalThis.window = {
+    ipc: {
+      invoke: (method) => {
+        if (method !== "ui:app.takeOpened") return Promise.resolve(null);
+        takes++;
+        return Promise.resolve({ urls: ["myapp://a"], files: ["/tmp/x.md"] });
+      },
+      on: (ch, fn) => { listeners.set(ch, fn); return () => listeners.delete(ch); },
+      menu: { on: () => () => {}, set: () => Promise.resolve(false) },
+      window: { setTheme: () => Promise.resolve() },
+    },
+  };
+  const m = await import("../index.js?opened");
+  const urls = [];
+  const files = [];
+  m.ui.app.on("open-url", (u) => urls.push(u));
+  m.ui.app.on("open-files", (f) => files.push(...f));
+  await new Promise((r) => setTimeout(r, 0));
+  listeners.get("ui:app:open-url")("myapp://b");
+  assert.deepEqual(urls, ["myapp://a", "myapp://b"]);
+  assert.deepEqual(files, ["/tmp/x.md"]);
+  assert.equal(takes, 1, "pending items are fetched once per page");
+  assert.throws(() => m.ui.app.on("nope", () => {}), /unknown ui.app event/);
+  delete globalThis.window;
+});

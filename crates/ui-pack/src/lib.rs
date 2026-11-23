@@ -3,6 +3,7 @@
 pub mod linux;
 pub mod macos;
 pub mod metadata;
+pub mod run;
 pub mod windows;
 
 #[cfg(test)]
@@ -13,6 +14,32 @@ mod tests {
     };
     use super::metadata::{AppMetadata, BackendTarget};
     use super::windows::render_appx_manifest;
+
+    #[test]
+    fn url_schemes_documents_and_entitlements() {
+        let meta = AppMetadata::parse(
+            "[package]\nname = \"notes\"\n[package.metadata.ui]\nbundle_id = \"com.example.notes\"\n\
+             url_schemes = [\"notes\", \"notes-dev\"]\ndocument_types = [\"md\", \".txt\"]\n\
+             entitlements = \"app.entitlements\"\nicon = \"assets/AppIcon.icns\"\n",
+        )
+        .unwrap();
+        assert_eq!(meta.url_schemes, ["notes", "notes-dev"]);
+        assert_eq!(meta.document_types, ["md", ".txt"]);
+        assert_eq!(meta.entitlements.as_deref(), Some("app.entitlements"));
+
+        let plist = render_info_plist(&meta, "notes");
+        assert!(plist.contains("<key>CFBundleURLSchemes</key>"));
+        assert!(plist.contains("<string>notes-dev</string>"));
+        assert!(plist.contains("<key>CFBundleTypeExtensions</key>"));
+        assert!(plist.contains("<string>txt</string>"), "leading dot stripped");
+        assert!(plist.contains("<key>CFBundleIconFile</key>\n  <string>AppIcon.icns</string>"));
+
+        let appx = render_appx_manifest(&meta, "notes.exe", "CN=Example");
+        assert!(appx.contains(r#"<uap:Protocol Name="notes" />"#));
+        assert!(appx.contains("<uap:FileType>.md</uap:FileType>"));
+        assert!(render_desktop_entry(&meta, "notes")
+            .contains("MimeType=x-scheme-handler/notes;x-scheme-handler/notes-dev;"));
+    }
 
     #[test]
     fn parses_package_metadata_ui() {
@@ -53,6 +80,7 @@ backend = "webkit"
                 output_dir: std::env::temp_dir(),
                 channel: MacChannel::AppStore,
                 cef_framework: None,
+                sign: None,
             },
         )
         .unwrap_err();
@@ -98,6 +126,7 @@ backend = "webkit"
                 output_dir: out_dir,
                 channel: MacChannel::Direct,
                 cef_framework: None,
+                sign: None,
             },
         )
         .unwrap();

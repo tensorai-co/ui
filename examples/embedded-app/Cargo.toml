@@ -6,6 +6,12 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[package.metadata.ui]
+name = "Embedded App"
+bundle_id = "dev.ui.embedded-app"
+url_schemes = ["uiembedded"]
+document_types = ["uidoc"]
+
 [dependencies]
 ui = { path = "../../crates/ui" }
 

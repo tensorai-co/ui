@@ -142,7 +142,42 @@ dock.bounce(Attention::Informational);
 dock.set_menu(vec![MenuItem::new("new_window", "New Window").emit()]);
 ```
 
+Window options live there too, along with the cross-platform `restore_state`:
+
+```rust
+use ui::macos::{ToolbarStyle, WindowBuilderExt, WindowExt, WindowLevel};
+
+let win = Window::new("Editor")
+    .title_bar(TitleBar::inset(52))
+    .restore_state("main") // frame, monitor and full screen remembered across launches
+    .macos(|m| m.toolbar_style(ToolbarStyle::Unified).titlebar_separator(false))
+    .open(app)?;
+win.macos().set_document_edited(true); // the dot in the close button (also ui.window.setDocumentEdited)
+win.macos().set_level(WindowLevel::Floating);
+```
+
+`MacWindowOptions` also has `window_controls_visible`, `all_spaces` and `fullscreen_auxiliary`; `ui::macos::forget_window_state(name)` resets a saved layout.
+
 Native context menus are also available from Rust: `window.popup_menu(vec![ContextMenuItem::new("rename", "Rename")], x, y)` returns the chosen id.
+
+### Deep Links, Opened Files & Single Instance
+
+```toml
+[package.metadata.ui]
+url_schemes = ["myapp"]          # myapp://… links (Info.plist, MSIX protocol, Linux MimeType)
+document_types = ["md", "txt"]   # files opened from Finder or dropped on the Dock icon
+```
+
+```rust
+app.on_event(|ev| match ev {
+    Event::OpenUrl(url) => { /* e.g. myapp://signin/callback?code=… */ }
+    Event::OpenFiles(paths) => { /* … */ }
+    Event::SecondInstance(args) => { /* focus the main window */ }
+    _ => {}
+});
+```
+
+Pages get the same with `ui.app.on("open-url", fn)` / `ui.app.on("open-files", fn)` from `ui-client`, including a link that launched the app before the page loaded. `SingleInstance::acquire` in a second launch returns `Ok(None)` and forwards its arguments; the running app calls `instance.listen(&app)` to receive them as `Event::SecondInstance` (URL arguments also arrive as `Event::OpenUrl`).
 
 ### Hosted URL App & Typed Commands
 
@@ -325,11 +360,15 @@ ui
 `ui-pack` reads `[package]` and `[package.metadata.ui]` (`name`, `bundle_id`, `icon`, `backend`, `category`, `min_macos`) from `Cargo.toml`:
 
 ```sh
-cargo run -p ui-pack -- macos --manifest path/to/Cargo.toml --bin target/release/my-app --out target/pack
+cargo run -p ui-pack -- macos --manifest path/to/Cargo.toml --bin target/release/my-app --out target/pack [--sign "Developer ID Application: …"]
+cargo run -p ui-pack -- run --manifest path/to/Cargo.toml [--release] [--dev]   # build, sign with entitlements, launch
+cargo run -p ui-pack -- icons assets/app-icon.png                              # AppIcon.iconset + AppIcon.icns
 ```
 
+`[package.metadata.ui]` also takes `url_schemes`, `document_types`, `entitlements = "app.entitlements"` (used to sign `macos` bundles and `run` binaries, and as the Mac App Store entitlements), and `dev_command` / `dev_url` for `ui-pack run --dev`, which starts the web dev server and sets `UI_DEV_URL`. An `icon` ending in `.icns` is copied into the bundle.
+
 - **`macos`**: Assembles `<DisplayName>.app`; for `backend = "cef"`, bundles `Chromium Embedded Framework.framework` and helper `.app` processes inside `Contents/Frameworks/` with `CFBundleIdentifier` aligned to `bundle_id`.
-- **`mas`**: Builds a sandboxed Mac App Store `.app` + `entitlements.mas.plist` (`com.apple.security.app-sandbox`) using the system webview (`backend = "cef"` is rejected).
+- **`mac-app-store`** (alias `mas`): Builds a sandboxed Mac App Store `.app` + `entitlements.mas.plist` (`com.apple.security.app-sandbox`) using the system webview (`backend = "cef"` is rejected).
 - **`msix` / `linux`**: Generates Windows `AppxManifest.xml` or Linux `.desktop` manifests.
 
 ---

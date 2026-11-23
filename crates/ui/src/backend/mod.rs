@@ -352,6 +352,9 @@ const BUILTIN_MENU_SET: &str = "ui:menu.set";
 const BUILTIN_CHROME: &str = "ui:chrome";
 const BUILTIN_SET_THEME: &str = "ui:window.setTheme";
 const BUILTIN_CONTEXT_MENU: &str = "ui:contextMenu";
+const BUILTIN_TAKE_OPENED: &str = "ui:app.takeOpened";
+const OPEN_URL_EVENT: &str = "ui:app:open-url";
+const OPEN_FILES_EVENT: &str = "ui:app:open-files";
 /// Event the shim turns into `--ui-*` CSS variables and `data-ui-*` attributes.
 const CHROME_EVENT: &str = "__ui_chrome";
 
@@ -369,6 +372,16 @@ pub(crate) struct Runtime {
     webviews: Mutex<HashMap<WebViewId, WebViewDispatchRecord>>,
     /// Calls running on worker threads, keyed by webview and page call id.
     calls: Mutex<HashMap<(WebViewId, u32), Arc<CallState>>>,
+    /// URLs and files opened before any page asked for them (`ui:app.takeOpened`).
+    opened: Mutex<OpenedQueue>,
+}
+
+/// Opened URLs/files wait here until a page claims them, then go out live.
+#[derive(Default)]
+struct OpenedQueue {
+    claimed: bool,
+    urls: Vec<String>,
+    files: Vec<PathBuf>,
 }
 
 struct WebViewDispatchSnapshot {
@@ -391,6 +404,7 @@ impl Runtime {
             app_event: Mutex::new(None),
             webviews: Mutex::new(HashMap::new()),
             calls: Mutex::new(HashMap::new()),
+            opened: Mutex::new(OpenedQueue::default()),
         })
     }
 
@@ -577,6 +591,62 @@ impl Runtime {
             f();
         } else {
             self.dispatch_on_main(Box::new(f));
+        }
+    }
+
+    /// Delivers an opened URL or files to pages: queued until a page claims
+    /// them with `ui:app.takeOpened`, then sent to every webview.
+    pub(crate) fn deliver_opened(self: &Arc<Self>, ev: &Event) {
+        let (event, payload) = match ev {
+            Event::OpenUrl(url) => (OPEN_URL_EVENT, Value::String(url.clone())),
+            Event::OpenFiles(files) => (
+                OPEN_FILES_EVENT,
+                Value::Array(
+                    files
+                        .iter()
+                        .map(|p| Value::String(p.to_string_lossy().into_owned()))
+                        .collect(),
+                ),
+            ),
+            _ => return,
+        };
+        {
+            let mut q = self.opened.lock().unwrap_or_else(|e| e.into_inner());
+            if !q.claimed {
+                match ev {
+                    Event::OpenUrl(url) => q.urls.push(url.clone()),
+                    Event::OpenFiles(files) => q.files.extend(files.iter().cloned()),
+                    _ => {}
+                }
+                return;
+            }
+        }
+        let ids: Vec<WebViewId> = self
+            .webviews
+            .lock()
+            .map(|g| g.keys().copied().collect())
+            .unwrap_or_default();
+        for id in ids {
+            self.webview_emit(id, event.to_owned(), payload.clone());
+        }
+    }
+
+    /// A second launch forwarded by `SingleInstance`: its arguments, plus any
+    /// that are URLs as `OpenUrl` (how deep links arrive on Windows and Linux).
+    pub(crate) fn handle_second_instance(self: &Arc<Self>, args: Vec<String>) {
+        let urls: Vec<String> = args
+            .iter()
+            .filter(|a| {
+                a.split_once("://")
+                    .is_some_and(|(scheme, _)| !scheme.is_empty() && scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)))
+            })
+            .cloned()
+            .collect();
+        self.emit_app_event(Event::SecondInstance(args));
+        for url in urls {
+            let ev = Event::OpenUrl(url);
+            self.deliver_opened(&ev);
+            self.emit_app_event(ev);
         }
     }
 
@@ -1452,6 +1522,29 @@ impl Runtime {
             };
             return reply(responder, update());
         }
+        if method == BUILTIN_TAKE_OPENED {
+            let mut q = self.opened.lock().unwrap_or_else(|e| e.into_inner());
+            q.claimed = true;
+            let urls = std::mem::take(&mut q.urls);
+            let files = std::mem::take(&mut q.files);
+            drop(q);
+            let v = Value::Object(BTreeMap::from([
+                (
+                    "urls".to_owned(),
+                    Value::Array(urls.into_iter().map(Value::String).collect()),
+                ),
+                (
+                    "files".to_owned(),
+                    Value::Array(
+                        files
+                            .into_iter()
+                            .map(|p| Value::String(p.to_string_lossy().into_owned()))
+                            .collect(),
+                    ),
+                ),
+            ]));
+            return reply(responder, Ok(v));
+        }
         if method == BUILTIN_CONTEXT_MENU {
             let items = match arg.get("items").map(ContextMenuItem::from_page) {
                 Some(Ok(items)) => items,
@@ -1707,6 +1800,7 @@ where
                             | WindowEvent::FullscreenChanged(_)
                             | WindowEvent::ThemeChanged(_),
                         ) => runtime.push_chrome(*win_id),
+                        Event::OpenUrl(_) | Event::OpenFiles(_) => runtime.deliver_opened(&ev),
                         _ => {}
                     }
                     runtime.emit_app_event(ev);

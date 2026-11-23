@@ -126,6 +126,10 @@ pub(crate) struct WindowSpec {
     pub tabbing: Tabbing,
     pub menu: Option<Menu>,
     pub on_event: Option<WindowEventHandler>,
+    /// Name under which the frame and full-screen state are remembered.
+    pub restore_state: Option<String>,
+    #[cfg(target_os = "macos")]
+    pub macos: crate::macos::MacWindowOptions,
 }
 
 /// Builder for configuring and opening a native window.
@@ -150,8 +154,28 @@ impl WindowBuilder {
                 tabbing: Tabbing::Automatic,
                 menu: None,
                 on_event: None,
+                restore_state: None,
+                #[cfg(target_os = "macos")]
+                macos: crate::macos::MacWindowOptions::default(),
             },
         }
+    }
+
+    /// Remembers the window's frame, monitor and full-screen state under `name`
+    /// and restores them the next time a window with that name opens, instead
+    /// of opening at the coded size and position every launch.
+    pub fn restore_state(mut self, name: impl Into<String>) -> Self {
+        self.spec.restore_state = Some(name.into());
+        self
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn map_macos(
+        mut self,
+        f: impl FnOnce(crate::macos::MacWindowOptions) -> crate::macos::MacWindowOptions,
+    ) -> Self {
+        self.spec.macos = f(std::mem::take(&mut self.spec.macos));
+        self
     }
 
     pub fn size(mut self, width: u32, height: u32) -> Self {

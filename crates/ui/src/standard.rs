@@ -69,7 +69,7 @@ impl StandardRpcs {
         self
     }
 
-    /// `ui.window.minimize / maximize / setFullscreen / setTitle / state / close`.
+    /// `ui.window.minimize / maximize / setFullscreen / setTitle / state / close / setDocumentEdited`.
     pub fn window(mut self) -> Self {
         self.window = true;
         self
@@ -286,7 +286,16 @@ pub(crate) fn install(mut b: WebViewBuilder, cfg: StandardRpcs) -> WebViewBuilde
             .invoke("ui:window.state", |ctx: Ctx, ()| {
                 state_name(ctx.window().state()).to_owned()
             })
-            .invoke("ui:window.close", |ctx: Ctx, ()| ctx.window().close());
+            .invoke("ui:window.close", |ctx: Ctx, ()| ctx.window().close())
+            .invoke("ui:window.setDocumentEdited", |ctx: Ctx, edited: bool| {
+                #[cfg(target_os = "macos")]
+                {
+                    use crate::macos::WindowExt;
+                    ctx.window().macos().set_document_edited(edited);
+                }
+                #[cfg(not(target_os = "macos"))]
+                let _ = (ctx, edited);
+            });
     }
     if cfg.notify {
         b = b.invoke("ui:notify", |ctx: Ctx, (title, body): (String, Option<String>)| {

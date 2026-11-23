@@ -17,6 +17,9 @@ pub struct MacPackOptions {
     pub output_dir: PathBuf,
     pub channel: MacChannel,
     pub cef_framework: Option<PathBuf>,
+    /// Code-signing identity; `"-"` signs ad hoc. `None` signs ad hoc only
+    /// when the manifest names `entitlements`.
+    pub sign: Option<String>,
 }
 
 pub fn render_info_plist(meta: &AppMetadata, executable: &str) -> String {
@@ -26,6 +29,7 @@ pub fn render_info_plist(meta: &AppMetadata, executable: &str) -> String {
     let exe = xml_escape(executable);
     let cat = xml_escape(&meta.category);
     let min_os = xml_escape(&meta.min_macos);
+    let extra = render_plist_extras(meta);
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -56,10 +60,71 @@ pub fn render_info_plist(meta: &AppMetadata, executable: &str) -> String {
   <string>{min_os}</string>
   <key>NSHighResolutionCapable</key>
   <true/>
-</dict>
+{extra}</dict>
 </plist>
 "#
     )
+}
+
+/// `CFBundleURLTypes`, `CFBundleDocumentTypes` and `CFBundleIconFile`, from metadata.
+fn render_plist_extras(meta: &AppMetadata) -> String {
+    let mut out = String::new();
+    if !meta.url_schemes.is_empty() {
+        out.push_str("  <key>CFBundleURLTypes</key>\n  <array>\n    <dict>\n");
+        out.push_str(&format!(
+            "      <key>CFBundleURLName</key>\n      <string>{}</string>\n",
+            xml_escape(&meta.bundle_id)
+        ));
+        out.push_str("      <key>CFBundleURLSchemes</key>\n      <array>\n");
+        for scheme in &meta.url_schemes {
+            out.push_str(&format!("        <string>{}</string>\n", xml_escape(scheme)));
+        }
+        out.push_str("      </array>\n    </dict>\n  </array>\n");
+    }
+    if !meta.document_types.is_empty() {
+        out.push_str("  <key>CFBundleDocumentTypes</key>\n  <array>\n");
+        for ext in &meta.document_types {
+            let ext = xml_escape(ext.trim_start_matches('.'));
+            out.push_str(&format!(
+                "    <dict>\n      <key>CFBundleTypeName</key>\n      <string>{ext} document</string>\n      \
+                 <key>CFBundleTypeRole</key>\n      <string>Editor</string>\n      \
+                 <key>LSHandlerRank</key>\n      <string>Alternate</string>\n      \
+                 <key>CFBundleTypeExtensions</key>\n      <array>\n        <string>{ext}</string>\n      </array>\n    </dict>\n"
+            ));
+        }
+        out.push_str("  </array>\n");
+    }
+    if let Some(icon) = meta.icon.as_deref().filter(|i| i.ends_with(".icns")) {
+        let file = Path::new(icon).file_name().and_then(|f| f.to_str()).unwrap_or(icon);
+        out.push_str(&format!(
+            "  <key>CFBundleIconFile</key>\n  <string>{}</string>\n",
+            xml_escape(file)
+        ));
+    }
+    out
+}
+
+/// Signs `path` with `identity` (`"-"` for ad hoc), with `entitlements` if given.
+pub fn codesign(path: &Path, identity: &str, entitlements: Option<&Path>) -> Result<(), String> {
+    let mut cmd = std::process::Command::new("codesign");
+    cmd.args(["--force", "--sign", identity]);
+    if let Some(e) = entitlements {
+        cmd.arg("--entitlements").arg(e);
+    }
+    if identity != "-" {
+        cmd.args(["--options", "runtime", "--timestamp"]);
+    }
+    let status = cmd.arg(path).status().map_err(|e| format!("spawn codesign: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("codesign failed for {}", path.display()))
+    }
+}
+
+/// The manifest's `entitlements` file, resolved against the manifest folder.
+pub fn entitlements_path(meta: &AppMetadata) -> Option<PathBuf> {
+    meta.entitlements.as_ref().map(|e| meta.manifest_dir.join(e))
 }
 
 pub fn render_sandbox_entitlements() -> &'static str {
@@ -106,12 +171,21 @@ pub fn pack_macos_app(meta: &AppMetadata, opts: &MacPackOptions) -> Result<PathB
     )
     .map_err(|e| format!("write Info.plist: {e}"))?;
 
+    if let Some(icon) = meta.icon.as_deref().filter(|i| i.ends_with(".icns")) {
+        let src = meta.manifest_dir.join(icon);
+        let name = Path::new(icon).file_name().unwrap_or_default();
+        fs::copy(&src, res_dir.join(name))
+            .map_err(|e| format!("copy icon {}: {e}", src.display()))?;
+    }
+
     if opts.channel == MacChannel::AppStore {
-        fs::write(
-            opts.output_dir.join("entitlements.mas.plist"),
-            render_sandbox_entitlements(),
-        )
-        .map_err(|e| format!("write entitlements: {e}"))?;
+        let mas = match entitlements_path(meta) {
+            Some(p) => fs::read_to_string(&p)
+                .map_err(|e| format!("read entitlements {}: {e}", p.display()))?,
+            None => render_sandbox_entitlements().to_owned(),
+        };
+        fs::write(opts.output_dir.join("entitlements.mas.plist"), mas)
+            .map_err(|e| format!("write entitlements: {e}"))?;
     } else if meta.backend == BackendTarget::Cef
         && let Some(ref cef_fw) = resolve_cef_framework(opts)
     {
@@ -145,6 +219,17 @@ pub fn pack_macos_app(meta: &AppMetadata, opts: &MacPackOptions) -> Result<PathB
                     }
                 }
             }
+        }
+    }
+
+    if opts.channel == MacChannel::Direct {
+        let entitlements = entitlements_path(meta);
+        let identity = opts
+            .sign
+            .clone()
+            .or_else(|| entitlements.as_ref().map(|_| "-".to_owned()));
+        if let Some(identity) = identity {
+            codesign(&app_dir, &identity, entitlements.as_deref())?;
         }
     }
 

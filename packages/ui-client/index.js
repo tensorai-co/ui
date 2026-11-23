@@ -78,6 +78,16 @@ function fileOptions(o) {
   };
 }
 
+// URLs and files opened before this page loaded (e.g. the link that launched
+// the app), fetched once and replayed to each `ui.app.on` listener.
+let openedOnce = null;
+function opened() {
+  if (!openedOnce) openedOnce = call("ui:app.takeOpened").catch(() => ({ urls: [], files: [] }));
+  return openedOnce;
+}
+
+const APP_EVENTS = { "open-url": "ui:app:open-url", "open-files": "ui:app:open-files" };
+
 const BUTTONS = { ok: "ok", okCancel: "ok_cancel", yesNo: "yes_no", yesNoCancel: "yes_no_cancel" };
 
 /** Typed wrappers for the standard page calls (see `WebViewBuilder::standard_rpcs`). */
@@ -88,6 +98,27 @@ export const ui = Object.freeze({
         return Promise.resolve({ name: typeof document !== "undefined" ? document.title : "", version: null, backend: "web", platform: "web" });
       }
       return call("ui:app.info");
+    },
+    /**
+     * "open-url": a URL with one of the app's schemes (fn gets the URL string).
+     * "open-files": files opened with the app (fn gets an array of paths).
+     * Includes anything that arrived before the page subscribed.
+     */
+    on(event, fn) {
+      const channel = APP_EVENTS[event];
+      if (!channel) throw new TypeError(`unknown ui.app event "${event}"`);
+      if (!isNative()) return () => {};
+      let active = true;
+      const off = ipc.on(channel, fn);
+      opened().then(({ urls, files }) => {
+        if (!active) return;
+        if (event === "open-url") for (const u of urls || []) fn(u);
+        else if (files && files.length) fn(files);
+      });
+      return () => {
+        active = false;
+        off();
+      };
     },
     openExternal(url) {
       if (!isNative()) {
@@ -138,6 +169,8 @@ export const ui = Object.freeze({
     },
     state: () => call("ui:window.state"),
     close: () => call("ui:window.close"),
+    /** The unsaved-changes dot in the close button (macOS). */
+    setDocumentEdited: (edited) => call("ui:window.setDocumentEdited", !!edited),
     setTheme: (theme) => ipc.window.setTheme(theme),
   }),
   menu: Object.freeze({

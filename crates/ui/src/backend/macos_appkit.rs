@@ -89,6 +89,10 @@ struct NativeWindowRecord {
     delegate: Id,
     title_bar: TitleBar,
     backdrop: Backdrop,
+    /// A toolbar style lays out the controls itself; don't move them.
+    native_controls_layout: bool,
+    /// `restore_state` name, for saving full-screen state.
+    restore_name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -148,6 +152,30 @@ extern "C" fn app_will_terminate(_: Id, _: Sel, _: Id) {
     APP_SHOULD_QUIT.store(true, Ordering::Release);
 }
 
+/// `application:openURLs:` receives custom-scheme URLs and opened files alike.
+extern "C" fn app_open_urls(_: Id, _: Sel, _: Id, urls: Id) {
+    let count = if urls.is_null() { 0 } else { msg!(usize; urls, "count") };
+    let mut files = Vec::new();
+    let mut links = Vec::new();
+    for i in 0..count {
+        let url = msg!(Id; urls, "objectAtIndex:", i => usize);
+        if url.is_null() {
+            continue;
+        }
+        if msg!(bool; url, "isFileURL") {
+            files.push(PathBuf::from(rust_string(msg!(Id; url, "path"))));
+        } else {
+            links.push(rust_string(msg!(Id; url, "absoluteString")));
+        }
+    }
+    if let Ok(mut q) = APP_EVENT_QUEUE.lock() {
+        q.extend(links.into_iter().map(Event::OpenUrl));
+        if !files.is_empty() {
+            q.push(Event::OpenFiles(files));
+        }
+    }
+}
+
 extern "C" fn app_should_reopen(_: Id, _: Sel, _: Id, _has_visible: bool) -> bool {
     if let Ok(mut q) = APP_EVENT_QUEUE.lock() {
         q.push(Event::Reopen);
@@ -170,6 +198,14 @@ extern "C" fn window_will_close(_: Id, _: Sel, notification: Id) {
         if let Ok(mut q) = WINDOW_EVENT_QUEUE.lock() {
             q.push((id, WindowEvent::Closed));
         }
+        // Save the frame now and release the autosave name, so a window
+        // reopened under the same name restores it (AppKit allows one owner).
+        if let Some(name) =
+            WINDOW_RECORDS.with(|r| r.borrow().get(&id).and_then(|rec| rec.restore_name.clone()))
+        {
+            msg!((); ns_win, "saveFrameUsingName:", ns_string(&name) => Id);
+            msg!(bool; ns_win, "setFrameAutosaveName:", ns_string("") => Id);
+        }
         cleanup_window_record(id);
     }
 }
@@ -181,15 +217,16 @@ extern "C" fn window_did_resize(_: Id, _: Sel, notification: Id) {
             WINDOW_RECORDS.with(|r| {
                 r.borrow()
                     .get(&id)
-                    .map(|rec| (id, rec.title_bar, rec.content_view))
+                    .map(|rec| (id, rec.title_bar, rec.content_view, rec.native_controls_layout))
             })
         })
     });
-    if let Some((id, title_bar, content_view)) = entry {
+    if let Some((id, title_bar, content_view, native_layout)) = entry {
         if let TitleBar::Inset {
             height,
             traffic_lights,
         } = title_bar
+            && !(native_layout && traffic_lights.is_none())
         {
             position_traffic_lights(ns_win, height, traffic_lights);
         }
@@ -212,12 +249,22 @@ extern "C" fn window_did_end_live_resize(_: Id, _: Sel, notification: Id) {
         m.borrow()
             .get(&(ns_win as usize))
             .copied()
-            .and_then(|id| WINDOW_RECORDS.with(|r| r.borrow().get(&id).map(|rec| rec.title_bar)))
+            .and_then(|id| {
+                WINDOW_RECORDS.with(|r| {
+                    r.borrow()
+                        .get(&id)
+                        .map(|rec| (rec.title_bar, rec.native_controls_layout))
+                })
+            })
     });
-    if let Some(TitleBar::Inset {
-        height,
-        traffic_lights,
-    }) = title_bar
+    if let Some((
+        TitleBar::Inset {
+            height,
+            traffic_lights,
+        },
+        native_layout,
+    )) = title_bar
+        && !(native_layout && traffic_lights.is_none())
     {
         position_traffic_lights(ns_win, height, traffic_lights);
     }
@@ -249,11 +296,134 @@ extern "C" fn app_dock_menu(_: Id, _: Sel, _: Id) -> Id {
 
 fn push_fullscreen_event(notification: Id, fullscreen: bool) {
     let ns_win = msg!(Id; notification, "object");
-    if let Some(id) = NS_TO_WINDOW_ID.with(|m| m.borrow().get(&(ns_win as usize)).copied())
-        && let Ok(mut q) = WINDOW_EVENT_QUEUE.lock()
+    let Some(id) = NS_TO_WINDOW_ID.with(|m| m.borrow().get(&(ns_win as usize)).copied()) else {
+        return;
+    };
+    if let Some(name) =
+        WINDOW_RECORDS.with(|r| r.borrow().get(&id).and_then(|rec| rec.restore_name.clone()))
     {
+        let defaults = msg!(Id; class("NSUserDefaults"), "standardUserDefaults");
+        msg!((); defaults, "setBool:forKey:", fullscreen => bool, ns_string(&fullscreen_key(&name)) => Id);
+    }
+    if let Ok(mut q) = WINDOW_EVENT_QUEUE.lock() {
         q.push((id, WindowEvent::FullscreenChanged(fullscreen)));
     }
+}
+
+fn fullscreen_key(name: &str) -> String {
+    format!("ui.window.{name}.fullscreen")
+}
+
+/// Removes the frame and full-screen state saved by `restore_state(name)`.
+pub(crate) fn forget_window_state(name: &str) {
+    let defaults = msg!(Id; class("NSUserDefaults"), "standardUserDefaults");
+    msg!((); defaults, "removeObjectForKey:", ns_string(&format!("NSWindow Frame {name}")) => Id);
+    msg!((); defaults, "removeObjectForKey:", ns_string(&fullscreen_key(name)) => Id);
+}
+
+fn ns_window_for(id: WindowId) -> Option<Id> {
+    WINDOW_RECORDS.with(|r| r.borrow().get(&id).map(|rec| rec.ns_window))
+}
+
+pub(crate) fn set_document_edited(id: WindowId, edited: bool) {
+    if let Some(w) = ns_window_for(id) {
+        msg!((); w, "setDocumentEdited:", edited => bool);
+    }
+}
+
+pub(crate) fn document_edited(id: WindowId) -> bool {
+    ns_window_for(id).is_some_and(|w| msg!(bool; w, "isDocumentEdited"))
+}
+
+pub(crate) fn set_window_controls_visible(id: WindowId, visible: bool) {
+    if let Some(w) = ns_window_for(id) {
+        apply_controls_visible(w, visible);
+    }
+}
+
+fn apply_controls_visible(ns_win: Id, visible: bool) {
+    for kind in 0usize..3 {
+        let btn = msg!(Id; ns_win, "standardWindowButton:", kind => usize);
+        if !btn.is_null() {
+            msg!((); btn, "setHidden:", !visible => bool);
+        }
+    }
+}
+
+const NS_FLOATING_WINDOW_LEVEL: isize = 3;
+
+pub(crate) fn set_window_level(id: WindowId, level: crate::macos::WindowLevel) {
+    if let Some(w) = ns_window_for(id) {
+        apply_level(w, level);
+    }
+}
+
+fn apply_level(ns_win: Id, level: crate::macos::WindowLevel) {
+    let raw = match level {
+        crate::macos::WindowLevel::Normal => 0isize,
+        crate::macos::WindowLevel::Floating => NS_FLOATING_WINDOW_LEVEL,
+    };
+    msg!((); ns_win, "setLevel:", raw => isize);
+}
+
+pub(crate) fn window_level(id: WindowId) -> crate::macos::WindowLevel {
+    match ns_window_for(id).map(|w| msg!(isize; w, "level")) {
+        Some(l) if l >= NS_FLOATING_WINDOW_LEVEL => crate::macos::WindowLevel::Floating,
+        _ => crate::macos::WindowLevel::Normal,
+    }
+}
+
+pub(crate) fn set_titlebar_separator(id: WindowId, on: bool) {
+    if let Some(w) = ns_window_for(id) {
+        apply_titlebar_separator(w, on);
+    }
+}
+
+fn apply_titlebar_separator(ns_win: Id, on: bool) {
+    if msg!(bool; ns_win, "respondsToSelector:", sel("setTitlebarSeparatorStyle:") => Sel) {
+        // NSTitlebarSeparatorStyleNone = 1, Line = 2.
+        let style: isize = if on { 2 } else { 1 };
+        msg!((); ns_win, "setTitlebarSeparatorStyle:", style => isize);
+    }
+}
+
+/// Applies `MacWindowOptions` before the window is shown.
+fn apply_mac_options(ns_win: Id, opts: &crate::macos::MacWindowOptions) {
+    use crate::macos::ToolbarStyle;
+    if let Some(style) = opts.toolbar_style {
+        let toolbar = msg!(Id; msg!(Id; class("NSToolbar"), "alloc"), "initWithIdentifier:", ns_string("ui.toolbar") => Id);
+        if !toolbar.is_null() {
+            msg!((); toolbar, "setShowsBaselineSeparator:", false => bool);
+            msg!((); ns_win, "setToolbar:", toolbar => Id);
+            release(toolbar);
+        }
+        if msg!(bool; ns_win, "respondsToSelector:", sel("setToolbarStyle:") => Sel) {
+            // NSWindowToolbarStyleExpanded = 1, Unified = 3, UnifiedCompact = 4.
+            let raw: isize = match style {
+                ToolbarStyle::Expanded => 1,
+                ToolbarStyle::Unified => 3,
+                ToolbarStyle::UnifiedCompact => 4,
+            };
+            msg!((); ns_win, "setToolbarStyle:", raw => isize);
+        }
+    }
+    if let Some(on) = opts.titlebar_separator {
+        apply_titlebar_separator(ns_win, on);
+    }
+    if !opts.window_controls_visible {
+        apply_controls_visible(ns_win, false);
+    }
+    if opts.level != crate::macos::WindowLevel::Normal {
+        apply_level(ns_win, opts.level);
+    }
+    let mut behavior = msg!(usize; ns_win, "collectionBehavior");
+    if opts.all_spaces {
+        behavior |= 1 << 0; // NSWindowCollectionBehaviorCanJoinAllSpaces
+    }
+    if opts.fullscreen_auxiliary {
+        behavior |= 1 << 8; // NSWindowCollectionBehaviorFullScreenAuxiliary
+    }
+    msg!((); ns_win, "setCollectionBehavior:", behavior => usize);
 }
 
 extern "C" fn window_did_enter_full_screen(_: Id, _: Sel, notification: Id) {
@@ -363,6 +533,11 @@ fn ensure_classes() -> (Id, Id, Id, Id) {
                     "applicationDockMenu:",
                     app_dock_menu as *const c_void,
                     "@@:@",
+                ),
+                (
+                    "application:openURLs:",
+                    app_open_urls as *const c_void,
+                    "v@:@@",
                 ),
                 (
                     "applicationShouldHandleReopen:hasVisibleWindows:",
@@ -650,7 +825,14 @@ pub(crate) fn open_ns_window(id: WindowId, spec: &WindowSpec) -> Result<Id> {
         set_app_menu(menu);
     }
 
-    if spec.position.is_none() {
+    apply_mac_options(ns_win, &spec.macos);
+
+    let mut restored = false;
+    if let Some(name) = &spec.restore_state {
+        restored = msg!(bool; ns_win, "setFrameUsingName:", ns_string(name) => Id);
+        msg!(bool; ns_win, "setFrameAutosaveName:", ns_string(name) => Id);
+    }
+    if spec.position.is_none() && !restored {
         msg!((); ns_win, "center");
     }
 
@@ -666,6 +848,8 @@ pub(crate) fn open_ns_window(id: WindowId, spec: &WindowSpec) -> Result<Id> {
                 delegate: del,
                 title_bar: spec.title_bar,
                 backdrop: spec.backdrop,
+                native_controls_layout: spec.macos.toolbar_style.is_some(),
+                restore_name: spec.restore_state.clone(),
             },
         );
     });
@@ -690,8 +874,18 @@ pub(crate) fn open_ns_window(id: WindowId, spec: &WindowSpec) -> Result<Id> {
         height,
         traffic_lights,
     } = spec.title_bar
+        && !(spec.macos.toolbar_style.is_some() && traffic_lights.is_none())
     {
         position_traffic_lights(ns_win, height, traffic_lights);
+    }
+
+    if let Some(name) = &spec.restore_state {
+        let defaults = msg!(Id; class("NSUserDefaults"), "standardUserDefaults");
+        if spec.visible
+            && msg!(bool; defaults, "boolForKey:", ns_string(&fullscreen_key(name)) => Id)
+        {
+            msg!((); ns_win, "toggleFullScreen:", NIL => Id);
+        }
     }
 
     Ok(ns_win)
@@ -957,6 +1151,8 @@ pub(crate) fn window_chrome(id: WindowId) -> Option<WindowChrome> {
     let mask = msg!(usize; ns_win, "styleMask");
     let fullscreen = (mask & (1 << 14)) != 0; // NSWindowStyleMaskFullScreen
     let focused = msg!(bool; ns_win, "isKeyWindow");
+    let native_layout =
+        WINDOW_RECORDS.with(|r| r.borrow().get(&id).is_some_and(|rec| rec.native_controls_layout));
     let (titlebar_height, controls_left) = match title_bar {
         TitleBar::Inset { height, .. } => {
             let left = if fullscreen {
@@ -964,7 +1160,16 @@ pub(crate) fn window_chrome(id: WindowId) -> Option<WindowChrome> {
             } else {
                 window_controls_extent(ns_win)
             };
-            (f64::from(height), left)
+            let h = if native_layout {
+                // The toolbar style decides the height: content above the layout rect.
+                let content = msg!(Id; ns_win, "contentView");
+                let full = rect_of(content, "bounds").size.height;
+                let layout = rect_of(ns_win, "contentLayoutRect").size.height;
+                (full - layout).max(0.0).round()
+            } else {
+                f64::from(height)
+            };
+            (h, left)
         }
         TitleBar::Native | TitleBar::Hidden => (0.0, 0.0),
     };
