@@ -282,8 +282,16 @@ impl Window {
         self.runtime.window_state(self.id)
     }
 
+    /// The appearance the window draws with (its own, or the system's).
     pub fn theme(&self) -> Theme {
         self.runtime.window_theme(self.id)
+    }
+
+    /// Sets the window's appearance: vibrancy, window controls and native
+    /// sheets follow it. `None` follows the system. Pages can do the same with
+    /// `ipc.window.setTheme("light" | "dark" | "system")`.
+    pub fn set_theme(&self, theme: Option<Theme>) {
+        self.runtime.set_window_theme(self.id, theme);
     }
 
     /// Starts a native OS window drag using the current pointer event.

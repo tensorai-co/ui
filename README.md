@@ -71,6 +71,39 @@ fn main() -> ui::Result<()> {
 }
 ```
 
+### Embedded Web Build & Dev Server
+
+`ui-build` embeds a bundler's output folder at compile time, so there's no hand-written asset table. A complete example lives in [examples/embedded-app](examples/embedded-app).
+
+```toml
+[build-dependencies]
+ui-build = { git = "https://github.com/tensorai-co/ui" }
+```
+
+```rust
+// build.rs: runs `npm run build` when dist/ is missing, in release builds, or with UI_BUILD_WEB=1
+fn main() { ui_build::web("dist").before("npm run build").emit(); }
+
+// main.rs
+WebView::new().bundle("app", ui::embedded!().spa("index.html").immutable("assets/"))
+```
+
+- The app opens at `app://localhost/` (the URL stays `/` for client-side routers). With `.spa(..)`, unknown paths that don't look like files serve the SPA page; missing files and paths under `.immutable(..)` folders are 404.
+- Files under `.immutable(..)` prefixes get `Cache-Control: public, max-age=31536000, immutable`; the rest get `no-cache`.
+- **Dev mode:** in debug builds, `UI_DEV_URL=http://localhost:5173 cargo run` loads the dev server (e.g. Vite with hot reload) in place of the bundle, and IPC keeps working. Only `localhost`, `127.0.0.1` and `[::1]` URLs are accepted.
+
+### Title Bar Layout in CSS & Window Theme
+
+The shim keeps CSS variables and attributes on `<html>` current, so pages don't hard-code window-control offsets:
+
+```css
+.toolbar { height: var(--ui-titlebar-height); padding-left: calc(var(--ui-window-controls-left) + 12px); }
+html[data-ui-fullscreen='true'] .toolbar { /* controls are hidden; --ui-window-controls-left is 0 */ }
+html[data-ui-focused='false'] .sidebar { opacity: 0.7; }
+```
+
+Also set: `--ui-window-controls-right`, `data-ui-platform` (`macos` / `windows` / `linux`) and `data-ui-theme` (`light` / `dark`, the window's effective appearance). `win.set_theme(Some(Theme::Light))`, or `ipc.window.setTheme("light" | "dark" | "system")` from the page, makes the window's vibrancy, controls and sheets follow the app's own theme setting instead of the system's.
+
 ### Hosted URL App & Typed Commands
 
 ```rust
@@ -136,6 +169,9 @@ const exitCode = await term.closed; // the handler's return value
 ipc.emit("ready");
 ipc.emit("upload", arrayBufferOrUint8Array);
 ipc.emit({ type: "set_title", title: "Updated Title" }); // dispatches to on_msg::<AppCmd>
+
+// Window appearance, independent of the system's
+await ipc.window.setTheme("dark"); // or "light" / "system"
 
 // Menu items made with .emit(), and live menu updates
 ipc.menu.on("toggle_panel", () => togglePanel());
@@ -224,6 +260,7 @@ ui
 ├── app        // run, App, SingleInstance
 ├── window     // Window, WindowBuilder, WindowId, TitleBar, Backdrop, Tabbing, Bounds, Display, Theme, WindowState
 ├── webview    // WebView, WebViewBuilder, WebViewId, Ctx, Request, Response, Mime, Nav, NavRequest, Profile, LoadState
+├── embed      // Embedded (+ embedded!), served with WebViewBuilder::bundle
 ├── ipc        // Bytes, Value, FromIpc, IntoIpc, DecodeError, RpcResult (+ json!, ipc_enum!, ipc_struct!)
 ├── menu       // Menu, Submenu, MenuItem, MenuItemHandle, MenuItemUpdate, Role, Shortcut, Mod
 ├── dialog     // Dialog, FileDialog, MessageDialog, Filter, MessageLevel, MessageButtons, MessageResult
@@ -306,6 +343,8 @@ Host -> Renderer (queued + coalesced)
 - `UI_CEF_SCHEMES`: Extra comma-separated custom scheme names for CEF subprocess registration.
 - `UI_CEF_LOG_CONSOLE=1`: Forward CEF JS `console` output to `stderr`.
 - `UI_HEADLESS=1`: Run pure-Rust conformance checks without launching a live window/webview.
+- `UI_DEV_URL`: In debug builds, load this `localhost` dev server in place of a webview's `assets`/`bundle` start page.
+- `UI_BUILD_WEB`: For `ui-build`, `1` always runs the `before` command and `0` never does.
 
 ### Workspace Layout
 
@@ -321,8 +360,11 @@ ui/
     │   ├── src/                # Public API + platform backends
     │   └── tests/
     │       └── conformance.rs  # Shared pure-Rust + live window/webview conformance suite (harness = false)
+    ├── ui-build/               # build.rs helper: embeds a web build for ui::embedded!(), runs the web build
     ├── ui-cef-sys/             # cef.lock + Spotify CEF fetcher, C11 helper bundler, cef_api_hash check, raw C-API FFI
     └── ui-pack/                # .app / MAS entitlements assembler & MSIX / .desktop manifest generators
+examples/
+└── embedded-app/               # ui-build + ui::embedded!() app, with a live test of the bundle and UI_DEV_URL
 ```
 
 ---

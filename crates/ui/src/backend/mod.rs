@@ -349,6 +349,10 @@ pub(crate) fn next_zoom_step(current: f64, zoom_in: bool) -> f64 {
 
 /// Built-in page calls handled by the runtime, ahead of app RPCs.
 const BUILTIN_MENU_SET: &str = "ui:menu.set";
+const BUILTIN_CHROME: &str = "ui:chrome";
+const BUILTIN_SET_THEME: &str = "ui:window.setTheme";
+/// Event the shim turns into `--ui-*` CSS variables and `data-ui-*` attributes.
+const CHROME_EVENT: &str = "__ui_chrome";
 
 type AppEventSlot = Mutex<Option<Box<dyn FnMut(Event) + Send>>>;
 
@@ -718,8 +722,83 @@ impl Runtime {
         })
     }
 
-    pub fn window_theme(self: &Arc<Self>, _id: WindowId) -> Theme {
-        self.app_theme()
+    pub fn window_theme(self: &Arc<Self>, id: WindowId) -> Theme {
+        self.call_main_sync(move || {
+            #[cfg(target_os = "macos")]
+            {
+                macos_appkit::window_theme(id)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = id;
+                Theme::Light
+            }
+        })
+    }
+
+    pub fn set_window_theme(self: &Arc<Self>, id: WindowId, theme: Option<Theme>) {
+        let rt = Arc::clone(self);
+        let f = move || {
+            #[cfg(target_os = "macos")]
+            macos_appkit::set_window_theme(id, theme);
+            #[cfg(not(target_os = "macos"))]
+            let _ = theme;
+            rt.push_chrome(id);
+        };
+        if self.is_main() {
+            f();
+        } else {
+            self.dispatch_on_main(Box::new(f));
+        }
+    }
+
+    /// Title-bar layout and window state for the shim's `--ui-*` CSS variables.
+    fn chrome_value(&self, id: WindowId) -> Value {
+        let platform = if cfg!(target_os = "macos") {
+            "macos"
+        } else if cfg!(windows) {
+            "windows"
+        } else {
+            "linux"
+        };
+        let mut m = BTreeMap::from([("platform".to_owned(), Value::String(platform.into()))]);
+        #[cfg(target_os = "macos")]
+        if let Some(c) = macos_appkit::window_chrome(id) {
+            m.insert("titlebar_height".into(), Value::Float(c.titlebar_height));
+            m.insert("controls_left".into(), Value::Float(c.controls_left));
+            m.insert("controls_right".into(), Value::Float(0.0));
+            m.insert("fullscreen".into(), Value::Bool(c.fullscreen));
+            m.insert("focused".into(), Value::Bool(c.focused));
+            let theme = match macos_appkit::window_theme(id) {
+                Theme::Dark => "dark",
+                Theme::Light => "light",
+            };
+            m.insert("theme".into(), Value::String(theme.into()));
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = id;
+        Value::Object(m)
+    }
+
+    /// Sends the window's current chrome to each of its webviews.
+    pub(crate) fn push_chrome(self: &Arc<Self>, win_id: WindowId) {
+        let ids: Vec<WebViewId> = self
+            .webviews
+            .lock()
+            .map(|g| {
+                g.iter()
+                    .filter(|(_, r)| r.window_id == win_id)
+                    .map(|(id, _)| *id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if ids.is_empty() {
+            return;
+        }
+        let chrome = self.chrome_value(win_id);
+        for id in ids {
+            self.webview_emit(id, CHROME_EVENT.to_owned(), chrome.clone());
+        }
     }
 
     pub fn begin_window_drag(self: &Arc<Self>, id: WindowId) {
@@ -1308,6 +1387,24 @@ impl Runtime {
             };
             return reply(responder, update());
         }
+        if method == BUILTIN_CHROME {
+            return reply(responder, Ok(self.chrome_value(snap.window_id)));
+        }
+        if method == BUILTIN_SET_THEME {
+            let theme = match arg.as_str() {
+                Some("light") => Some(Theme::Light),
+                Some("dark") => Some(Theme::Dark),
+                Some("system") | None => None,
+                Some(other) => {
+                    return reply(
+                        responder,
+                        Err(format!("unknown theme \"{other}\"; use light, dark or system")),
+                    );
+                }
+            };
+            self.set_window_theme(snap.window_id, theme);
+            return reply(responder, Ok(Value::Null));
+        }
         let Some(handler) = snap.rpcs.get(&method) else {
             reply(responder, Err(format!("unknown RPC method: {method}")));
             return;
@@ -1512,8 +1609,17 @@ where
                 }
 
                 macos_appkit::drain_queued_events(|ev| {
-                    if let Event::Window(win_id, WindowEvent::Closed) = &ev {
-                        runtime.cleanup_webviews_for_window(*win_id);
+                    match &ev {
+                        Event::Window(win_id, WindowEvent::Closed) => {
+                            runtime.cleanup_webviews_for_window(*win_id);
+                        }
+                        Event::Window(
+                            win_id,
+                            WindowEvent::Focused(_)
+                            | WindowEvent::FullscreenChanged(_)
+                            | WindowEvent::ThemeChanged(_),
+                        ) => runtime.push_chrome(*win_id),
+                        _ => {}
                     }
                     runtime.emit_app_event(ev);
                 });

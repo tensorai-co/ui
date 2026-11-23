@@ -30,6 +30,10 @@ ui::ipc_struct! {
         endless: String,
         menu_found: bool,
         menu_missing: bool,
+        titlebar: String,
+        controls_left: f64,
+        platform_attr: String,
+        dark_ok: bool,
         missing: Option<String>,
     }
 }
@@ -269,9 +273,26 @@ fn check_live_window_and_webview() {
   const endlessResult = await endless.closed;
   const menuFound = await ipc.menu.set({ id: "role:ActualSize", checked: true, enabled: false });
   const menuMissing = await ipc.menu.set({ id: "no-such-item", enabled: false });
+  const waitFor = async (pred) => {
+    for (let i = 0; i < 150; i++) {
+      if (pred()) return true;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    return false;
+  };
+  const root = document.documentElement;
+  await waitFor(() => root.hasAttribute("data-ui-platform"));
+  const css = getComputedStyle(root);
+  const titlebar = css.getPropertyValue("--ui-titlebar-height").trim();
+  const controlsLeft = parseFloat(css.getPropertyValue("--ui-window-controls-left")) || 0;
+  const platformAttr = root.getAttribute("data-ui-platform") || "";
+  await ipc.window.setTheme("dark");
+  const darkOk = await waitFor(() => root.getAttribute("data-ui-theme") === "dark");
+  await ipc.window.setTheme("system");
   ipc.emit("v2_report", {
     added, timed_out: timedOut, chunks: chunks.join(","), closed_with: closedWith,
     misuse, endless: endlessResult, menu_found: menuFound, menu_missing: menuMissing,
+    titlebar, controls_left: controlsLeft, platform_attr: platformAttr, dark_ok: darkOk,
   });
 
   ipc.send("bin_upload", new Uint8Array([1, 2, 3, 4]));
@@ -499,8 +520,15 @@ boot();"#;
     );
     assert!(g.cancel_seen, "a page timeout must set ctx.is_cancelled()");
     assert!(g.stream_stopped, "stream.close() must close the Rust side");
+    let mut report = g.v2_report.clone().expect("v2 report");
+    assert!(
+        (40.0..120.0).contains(&report.controls_left),
+        "--ui-window-controls-left should cover the three controls, got {}",
+        report.controls_left
+    );
+    report.controls_left = 0.0;
     assert_eq!(
-        g.v2_report,
+        Some(report),
         Some(V2Report {
             added: 5,
             timed_out: true,
@@ -510,6 +538,10 @@ boot();"#;
             endless: "stopped".into(),
             menu_found: cfg!(target_os = "macos"),
             menu_missing: false,
+            titlebar: "38px".into(),
+            controls_left: 0.0,
+            platform_attr: "macos".into(),
+            dark_ok: true,
             missing: None,
         }),
         "invoke_blocking / timeout / stream results"

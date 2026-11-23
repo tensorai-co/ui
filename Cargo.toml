@@ -1,8 +1,10 @@
 [workspace]
 members = [
     "crates/ui",
+    "crates/ui-build",
     "crates/ui-cef-sys",
     "crates/ui-pack",
+    "examples/embedded-app",
 ]
 default-members = ["crates/ui"]
 resolver = "3"

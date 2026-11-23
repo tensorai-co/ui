@@ -1,0 +1,20 @@
+[package]
+name = "embedded-app"
+description = "Example: a ui app with its web build embedded by ui-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ui = { path = "../../crates/ui" }
+
+[build-dependencies]
+ui-build = { path = "../../crates/ui-build" }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "live"
+harness = false

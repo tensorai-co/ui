@@ -3,6 +3,7 @@
 pub mod app;
 mod call;
 pub mod dialog;
+pub mod embed;
 pub mod error;
 pub mod event;
 pub mod ipc;

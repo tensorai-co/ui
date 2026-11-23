@@ -332,6 +332,21 @@ impl Ctx {
 
 pub(crate) type AssetHandler = Arc<dyn Fn(&Request) -> Response + Send + Sync>;
 
+/// The dev-server URL from `UI_DEV_URL`, if it is set and points at this machine.
+pub(crate) fn dev_url_from(value: Option<&str>) -> Option<String> {
+    let url = value?.trim();
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().map(|h| format!("[{h}]"))?
+    } else {
+        authority.split(':').next().unwrap_or("").to_ascii_lowercase()
+    };
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]").then(|| url.to_owned())
+}
+
 /// How a registered RPC runs, checked against how the page called it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RpcKind {
@@ -375,6 +390,8 @@ pub(crate) enum InitialContent {
 
 pub(crate) struct WebViewSpec {
     pub initial: InitialContent,
+    /// The start page came from `assets(..)`, so `UI_DEV_URL` may replace it.
+    pub dev_url_allowed: bool,
     pub scheme_handlers: BTreeMap<String, AssetHandler>,
     pub profile: Profile,
     pub inspectable: bool,
@@ -400,6 +417,7 @@ impl WebViewBuilder {
         Self {
             spec: WebViewSpec {
                 initial: InitialContent::None,
+                dev_url_allowed: false,
                 scheme_handlers: BTreeMap::new(),
                 profile: Profile::Default,
                 inspectable: false,
@@ -439,16 +457,35 @@ impl WebViewBuilder {
     }
 
     /// Registers a custom URL scheme (for example `"app"`) serving `app://localhost/...`
-    /// and navigates to `<scheme>://localhost/index.html` if no URL/HTML was explicitly set.
-    pub fn assets<F>(mut self, scheme: impl Into<String>, handler: F) -> Self
+    /// and navigates to `<scheme>://localhost/` if no URL/HTML was explicitly set.
+    ///
+    /// In debug builds, `UI_DEV_URL=http://localhost:5173` loads that dev server
+    /// in place of this start page (IPC keeps working), for hot reload without
+    /// rebuilding the bundle. Only `localhost` / `127.0.0.1` / `[::1]` URLs are used.
+    pub fn assets<F>(self, scheme: impl Into<String>, handler: F) -> Self
     where
         F: Fn(&Request) -> Response + Send + Sync + 'static,
     {
-        let scheme = scheme.into().to_ascii_lowercase();
+        self.scheme_handler(scheme.into(), Arc::new(handler))
+    }
+
+    /// Serves a web build embedded by `ui-build` from a custom scheme, like
+    /// [`assets`](Self::assets) (including `UI_DEV_URL`):
+    ///
+    /// ```ignore
+    /// WebView::new().bundle("app", ui::embedded!().spa("index.html").immutable("assets/"))
+    /// ```
+    pub fn bundle(self, scheme: impl Into<String>, files: crate::embed::Embedded) -> Self {
+        self.scheme_handler(scheme.into(), Arc::new(move |req: &Request| files.serve(req)))
+    }
+
+    fn scheme_handler(mut self, scheme: String, handler: AssetHandler) -> Self {
+        let scheme = scheme.to_ascii_lowercase();
         if matches!(self.spec.initial, InitialContent::None) {
-            self.spec.initial = InitialContent::Url(format!("{scheme}://localhost/index.html"));
+            self.spec.initial = InitialContent::Url(format!("{scheme}://localhost/"));
+            self.spec.dev_url_allowed = true;
         }
-        self.spec.scheme_handlers.insert(scheme, Arc::new(handler));
+        self.spec.scheme_handlers.insert(scheme, handler);
         self
     }
 
@@ -685,7 +722,16 @@ impl WebViewBuilder {
                 "custom scheme \"{IPC_SCHEME}\" is reserved for ui binary IPC"
             )));
         }
-        win.runtime.mount_webview(win.id, self.spec)
+        let mut spec = self.spec;
+        if cfg!(debug_assertions) && spec.dev_url_allowed {
+            let env = std::env::var("UI_DEV_URL").ok();
+            if let Some(url) = dev_url_from(env.as_deref()) {
+                spec.initial = InitialContent::Url(url);
+            } else if env.is_some_and(|v| !v.trim().is_empty()) {
+                eprintln!("ui: ignoring UI_DEV_URL: only http(s)://localhost URLs are used");
+            }
+        }
+        win.runtime.mount_webview(win.id, spec)
     }
 }
 
@@ -826,5 +872,34 @@ impl Eq for WebView {}
 impl Hash for WebView {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dev_url_from;
+
+    #[test]
+    fn dev_url_only_accepts_this_machine() {
+        for ok in [
+            "http://localhost:5173",
+            "http://localhost:5173/app/",
+            "https://LOCALHOST",
+            "http://127.0.0.1:3000",
+            "http://[::1]:8080/",
+        ] {
+            assert_eq!(dev_url_from(Some(ok)).as_deref(), Some(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "localhost:5173",
+            "file:///tmp/index.html",
+            "http://example.com",
+            "http://localhost.evil.com",
+            "http://evil.com/?localhost",
+        ] {
+            assert_eq!(dev_url_from(Some(bad)), None, "{bad}");
+        }
+        assert_eq!(dev_url_from(None), None);
     }
 }

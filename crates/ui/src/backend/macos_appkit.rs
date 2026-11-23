@@ -238,6 +238,23 @@ extern "C" fn window_did_become_key(_: Id, _: Sel, notification: Id) {
     }
 }
 
+fn push_fullscreen_event(notification: Id, fullscreen: bool) {
+    let ns_win = msg!(Id; notification, "object");
+    if let Some(id) = NS_TO_WINDOW_ID.with(|m| m.borrow().get(&(ns_win as usize)).copied())
+        && let Ok(mut q) = WINDOW_EVENT_QUEUE.lock()
+    {
+        q.push((id, WindowEvent::FullscreenChanged(fullscreen)));
+    }
+}
+
+extern "C" fn window_did_enter_full_screen(_: Id, _: Sel, notification: Id) {
+    push_fullscreen_event(notification, true);
+}
+
+extern "C" fn window_did_exit_full_screen(_: Id, _: Sel, notification: Id) {
+    push_fullscreen_event(notification, false);
+}
+
 extern "C" fn window_did_resign_key(_: Id, _: Sel, notification: Id) {
     let ns_win = msg!(Id; notification, "object");
     if let Some(id) = NS_TO_WINDOW_ID.with(|m| m.borrow().get(&(ns_win as usize)).copied())
@@ -395,6 +412,16 @@ fn ensure_classes() -> (Id, Id, Id, Id) {
                 (
                     "windowDidBecomeKey:",
                     window_did_become_key as *const c_void,
+                    &notif_types,
+                ),
+                (
+                    "windowDidEnterFullScreen:",
+                    window_did_enter_full_screen as *const c_void,
+                    &notif_types,
+                ),
+                (
+                    "windowDidExitFullScreen:",
+                    window_did_exit_full_screen as *const c_void,
                     &notif_types,
                 ),
                 (
@@ -896,6 +923,88 @@ pub(crate) fn close_window(id: WindowId) {
     if let Some((ns_win, _, _)) = window_ns_ids(id) {
         msg!((); ns_win, "close");
         cleanup_window_record(id);
+    }
+}
+
+/// What a page needs to lay itself out around the window's title bar and controls.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct WindowChrome {
+    /// Height of the title-bar strip the page draws under (0 with a native title bar).
+    pub titlebar_height: f64,
+    /// Width the window controls take from the left edge, margins included.
+    pub controls_left: f64,
+    pub fullscreen: bool,
+    pub focused: bool,
+}
+
+pub(crate) fn window_chrome(id: WindowId) -> Option<WindowChrome> {
+    let (ns_win, title_bar) =
+        WINDOW_RECORDS.with(|r| r.borrow().get(&id).map(|rec| (rec.ns_window, rec.title_bar)))?;
+    let mask = msg!(usize; ns_win, "styleMask");
+    let fullscreen = (mask & (1 << 14)) != 0; // NSWindowStyleMaskFullScreen
+    let focused = msg!(bool; ns_win, "isKeyWindow");
+    let (titlebar_height, controls_left) = match title_bar {
+        TitleBar::Inset { height, .. } => {
+            let left = if fullscreen {
+                0.0
+            } else {
+                window_controls_extent(ns_win)
+            };
+            (f64::from(height), left)
+        }
+        TitleBar::Native | TitleBar::Hidden => (0.0, 0.0),
+    };
+    Some(WindowChrome {
+        titlebar_height,
+        controls_left,
+        fullscreen,
+        focused,
+    })
+}
+
+/// Right edge of the zoom button plus the same margin the close button has on
+/// the left, i.e. the strip a page should leave free for the controls.
+fn window_controls_extent(ns_win: Id) -> f64 {
+    let close_btn = msg!(Id; ns_win, "standardWindowButton:", 0usize => usize);
+    let zoom_btn = msg!(Id; ns_win, "standardWindowButton:", 2usize => usize);
+    if close_btn.is_null() || zoom_btn.is_null() || msg!(bool; zoom_btn, "isHidden") {
+        return 0.0;
+    }
+    let close = rect_of(close_btn, "frame");
+    let zoom = rect_of(zoom_btn, "frame");
+    (zoom.origin.x + zoom.size.width + close.origin.x.max(0.0)).round()
+}
+
+/// Sets this window's appearance; `None` follows the system.
+pub(crate) fn set_window_theme(id: WindowId, theme: Option<Theme>) {
+    let Some((ns_win, _, _)) = window_ns_ids(id) else {
+        return;
+    };
+    let appearance = match theme {
+        Some(Theme::Light) => {
+            msg!(Id; class("NSAppearance"), "appearanceNamed:", ns_string("NSAppearanceNameAqua") => Id)
+        }
+        Some(Theme::Dark) => {
+            msg!(Id; class("NSAppearance"), "appearanceNamed:", ns_string("NSAppearanceNameDarkAqua") => Id)
+        }
+        None => NIL,
+    };
+    msg!((); ns_win, "setAppearance:", appearance => Id);
+}
+
+/// The appearance this window actually draws with.
+pub(crate) fn window_theme(id: WindowId) -> Theme {
+    let Some((ns_win, _, _)) = window_ns_ids(id) else {
+        return app_theme();
+    };
+    let appearance = msg!(Id; ns_win, "effectiveAppearance");
+    if appearance.is_null() {
+        return app_theme();
+    }
+    if rust_string(msg!(Id; appearance, "name")).contains("Dark") {
+        Theme::Dark
+    } else {
+        Theme::Light
     }
 }
 

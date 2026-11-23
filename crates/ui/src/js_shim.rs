@@ -541,6 +541,12 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
       wrapper._ipcOrig = fn;
       return api.on(key, wrapper);
     },
+    window: Object.freeze({
+      // "light" | "dark" | "system": the native window's appearance.
+      setTheme(theme) {
+        return api.invoke("ui:window.setTheme", theme);
+      }
+    }),
     menu: Object.freeze({
       // Fires when a menu item made with `.emit()` (or "settings") is chosen.
       on(id, fn) {
@@ -564,6 +570,40 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
   });
 
   window.ipc = api;
+
+  // Title-bar layout and window state as CSS variables and attributes on <html>:
+  //   --ui-titlebar-height, --ui-window-controls-left, --ui-window-controls-right
+  //   data-ui-platform, data-ui-fullscreen, data-ui-focused, data-ui-theme
+  let chrome = null;
+  function applyChrome() {
+    const root = document.documentElement;
+    if (!root || !chrome) return;
+    const px = (v) => (typeof v === "number" ? v : 0) + "px";
+    root.style.setProperty("--ui-titlebar-height", px(chrome.titlebar_height));
+    root.style.setProperty("--ui-window-controls-left", px(chrome.controls_left));
+    root.style.setProperty("--ui-window-controls-right", px(chrome.controls_right));
+    if (chrome.platform) root.setAttribute("data-ui-platform", chrome.platform);
+    if (chrome.theme) root.setAttribute("data-ui-theme", chrome.theme);
+    root.setAttribute("data-ui-fullscreen", chrome.fullscreen ? "true" : "false");
+    root.setAttribute("data-ui-focused", chrome.focused === false ? "false" : "true");
+  }
+  function setChrome(c) {
+    if (!c || typeof c !== "object") return;
+    chrome = c;
+    if (document.documentElement) {
+      applyChrome();
+    } else {
+      const mo = new MutationObserver(() => {
+        if (document.documentElement) {
+          mo.disconnect();
+          applyChrome();
+        }
+      });
+      mo.observe(document, { childList: true });
+    }
+  }
+  api.on("__ui_chrome", setChrome);
+  api.invoke("ui:chrome").then(setChrome, () => {});
 
   function isInteractive(el) {
     return el.matches("input, textarea, select, option, button, a, summary, [contenteditable], [data-ui-no-drag]");

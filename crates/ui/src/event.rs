@@ -25,6 +25,8 @@ pub enum WindowEvent {
     Closed,
     ThemeChanged(Theme),
     BoundsChanged(Bounds),
+    /// The window entered (`true`) or left (`false`) full screen.
+    FullscreenChanged(bool),
 }
 
 /// WebView engine events.
