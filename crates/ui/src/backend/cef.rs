@@ -20,7 +20,7 @@ use crate::backend::{
     IpcEndpoint, IpcReplyTarget, IpcResponder, IpcRouteAction, ipc_binary_response,
 };
 use crate::event::WebViewEvent;
-use crate::ipc::{Value, encode_base64, encode_rpc_response};
+use crate::ipc::{CallSpec, Value, encode_base64, encode_rpc_response};
 use crate::js_shim::SHIM_JS;
 #[cfg(not(target_os = "macos"))]
 use crate::platform;
@@ -471,6 +471,7 @@ enum ResourceKind {
         endpoint: Arc<IpcEndpoint>,
         method: String,
         arg: Value,
+        call: CallSpec,
         state: Arc<Mutex<CefAsyncState>>,
     },
     Async(Arc<Mutex<CefAsyncState>>),
@@ -514,10 +515,11 @@ unsafe extern "C" fn res_open(
                     endpoint,
                     method,
                     arg,
+                    call,
                     state,
                 } = prev
                 {
-                    Some((endpoint, method, arg, state))
+                    Some((endpoint, method, arg, call, state))
                 } else {
                     None
                 }
@@ -525,13 +527,13 @@ unsafe extern "C" fn res_open(
         }
     };
 
-    if let Some((endpoint, method, arg, state)) = pending {
+    if let Some((endpoint, method, arg, call, state)) = pending {
         {
             let mut sg = state.lock().unwrap_or_else(|e| e.into_inner());
             sg.callback = callback as usize;
         }
         let responder = IpcResponder::new(IpcReplyTarget::Cef(Arc::clone(&state)));
-        if let Err(responder) = endpoint.enqueue_rpc(method, arg, responder) {
+        if let Err(responder) = endpoint.enqueue_rpc(method, arg, call, responder) {
             // Runtime already exited: disarm responder before taking callback & respond synchronously.
             std::mem::forget(responder);
             let cb_ptr = {
@@ -847,10 +849,12 @@ fn resolve_scheme_handler(
             IpcRouteAction::AsyncRpc {
                 method: rpc_method,
                 arg,
+                call,
             } => alloc_resource_handler_with_kind(ResourceKind::PendingRpc {
                 endpoint,
                 method: rpc_method,
                 arg,
+                call,
                 state: Arc::new(Mutex::new(CefAsyncState::default())),
             }),
         };

@@ -1,6 +1,7 @@
 //! A from-scratch, zero-third-party-crate Rust UI shell and webview framework for single-page desktop apps.
 
 pub mod app;
+mod call;
 pub mod dialog;
 pub mod error;
 pub mod event;
@@ -14,6 +15,7 @@ mod backend;
 mod js_shim;
 
 pub use app::{App, SingleInstance, run};
+pub use call::Stream;
 pub use dialog::Dialog;
 pub use error::{Error, Result};
 pub use ipc::{Bytes, DecodeError, FromIpc, IntoIpc, RpcResult, Value};

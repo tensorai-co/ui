@@ -286,10 +286,11 @@ extern "C" fn start_url_scheme_task(this: Id, _sel: Sel, _wk: Id, task: Id) {
             IpcRouteAction::AsyncRpc {
                 method: rpc_method,
                 arg,
+                call,
             } => {
                 let token = register_wk_task(id, task);
                 let responder = IpcResponder::new(IpcReplyTarget::WebKit(token));
-                if let Err(responder) = endpoint.enqueue_rpc(rpc_method, arg, responder) {
+                if let Err(responder) = endpoint.enqueue_rpc(rpc_method, arg, call, responder) {
                     responder.finish(ipc_binary_response(
                         200,
                         encode_rpc_response(Err("webview closed".to_owned())),

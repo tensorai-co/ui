@@ -11,6 +11,8 @@ pub enum Event {
     ThemeChanged(Theme),
     Reopen,
     QuitRequested,
+    /// A menu item made with `.emit()` (or `Role::Settings`, as `"settings"`) was chosen.
+    Menu(String),
 }
 
 /// Native window events.

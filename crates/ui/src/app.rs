@@ -49,6 +49,15 @@ impl App {
         self.runtime.displays()
     }
 
+    /// Handle to an item of the current app menu by id, to change its title,
+    /// enabled state or check mark.
+    pub fn menu_item(&self, id: impl Into<String>) -> crate::menu::MenuItemHandle {
+        crate::menu::MenuItemHandle {
+            id: id.into(),
+            runtime: self.runtime.clone(),
+        }
+    }
+
     pub fn menu(&self, menu: Menu) {
         self.runtime.set_menu(menu);
     }

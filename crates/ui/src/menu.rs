@@ -59,7 +59,13 @@ impl Shortcut {
 /// Built-in OS responder/action roles wired natively (especially macOS `Edit` & app menu).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Role {
+    /// "About <App>". The app's name is added on macOS.
     About,
+    /// "Settings…" (Cmd+,). Emits `menu:settings` to the focused webview and
+    /// [`Event::Menu`](crate::event::Event::Menu)`("settings")` to the app.
+    Settings,
+    /// The system Services submenu (macOS).
+    Services,
     Hide,
     HideOthers,
     ShowAll,
@@ -70,10 +76,46 @@ pub enum Role {
     Copy,
     Paste,
     SelectAll,
+    /// Reloads the focused webview (Cmd+R).
+    Reload,
+    /// History back in the focused webview (Cmd+[).
+    Back,
+    /// History forward in the focused webview (Cmd+]).
+    Forward,
+    /// Resets the focused webview's page zoom (Cmd+0).
+    ActualSize,
+    /// Zooms the focused webview in one step (Cmd+=).
+    ZoomIn,
+    /// Zooms the focused webview out one step (Cmd+-).
+    ZoomOut,
+    /// Opens developer tools for the focused webview (Alt+Cmd+I); CEF only.
+    ToggleDevTools,
     Minimize,
+    /// Zooms the window (maximize/restore); "Zoom" in the macOS Window menu.
     Zoom,
+    /// Brings all of the app's windows to the front (macOS).
+    BringAllToFront,
     CloseWindow,
     Fullscreen,
+    /// "<App> Help": opens the app's Help Book (macOS).
+    Help,
+}
+
+impl Role {
+    /// Roles the runtime carries out on the focused webview, rather than the OS.
+    pub(crate) fn is_webview_role(self) -> bool {
+        matches!(
+            self,
+            Self::Settings
+                | Self::Reload
+                | Self::Back
+                | Self::Forward
+                | Self::ActualSize
+                | Self::ZoomIn
+                | Self::ZoomOut
+                | Self::ToggleDevTools
+        )
+    }
 }
 
 /// Item inside a submenu.
@@ -84,6 +126,10 @@ pub enum MenuItem {
         title: String,
         shortcut: Option<Shortcut>,
         enabled: bool,
+        /// Shows a check mark (macOS `NSControlStateValueOn`).
+        checked: bool,
+        /// Clicking emits `menu:<id>` to the focused webview and `Event::Menu(id)`.
+        emit: bool,
         role: Option<Role>,
         handler: Option<Arc<dyn Fn() + Send + Sync>>,
     },
@@ -98,6 +144,8 @@ impl std::fmt::Debug for MenuItem {
                 title,
                 shortcut,
                 enabled,
+                checked,
+                emit,
                 role,
                 ..
             } => f
@@ -106,6 +154,8 @@ impl std::fmt::Debug for MenuItem {
                 .field("title", title)
                 .field("shortcut", shortcut)
                 .field("enabled", enabled)
+                .field("checked", checked)
+                .field("emit", emit)
                 .field("role", role)
                 .finish(),
             Self::Separator => write!(f, "Separator"),
@@ -120,6 +170,8 @@ impl MenuItem {
             title: title.into(),
             shortcut: None,
             enabled: true,
+            checked: false,
+            emit: false,
             role: None,
             handler: None,
         }
@@ -128,6 +180,8 @@ impl MenuItem {
     pub fn role(role: Role) -> Self {
         let (title, shortcut) = match role {
             Role::About => ("About", None),
+            Role::Settings => ("Settings…", Some(Shortcut::cmd(","))),
+            Role::Services => ("Services", None),
             Role::Hide => ("Hide", Some(Shortcut::cmd("h"))),
             Role::HideOthers => (
                 "Hide Others",
@@ -141,8 +195,20 @@ impl MenuItem {
             Role::Copy => ("Copy", Some(Shortcut::cmd("c"))),
             Role::Paste => ("Paste", Some(Shortcut::cmd("v"))),
             Role::SelectAll => ("Select All", Some(Shortcut::cmd("a"))),
+            Role::Reload => ("Reload", Some(Shortcut::cmd("r"))),
+            Role::Back => ("Back", Some(Shortcut::cmd("["))),
+            Role::Forward => ("Forward", Some(Shortcut::cmd("]"))),
+            Role::ActualSize => ("Actual Size", Some(Shortcut::cmd("0"))),
+            Role::ZoomIn => ("Zoom In", Some(Shortcut::cmd("="))),
+            Role::ZoomOut => ("Zoom Out", Some(Shortcut::cmd("-"))),
+            Role::ToggleDevTools => (
+                "Developer Tools",
+                Some(Shortcut::new(Mod::PRIMARY | Mod::ALT, "i")),
+            ),
             Role::Minimize => ("Minimize", Some(Shortcut::cmd("m"))),
             Role::Zoom => ("Zoom", None),
+            Role::BringAllToFront => ("Bring All to Front", None),
+            Role::Help => ("Help", Some(Shortcut::cmd_shift("/"))),
             Role::CloseWindow => ("Close Window", Some(Shortcut::cmd("w"))),
             Role::Fullscreen => (
                 "Toggle Full Screen",
@@ -150,10 +216,16 @@ impl MenuItem {
             ),
         };
         Self::Action {
-            id: format!("role:{role:?}"),
+            id: if role == Role::Settings {
+                "settings".to_owned()
+            } else {
+                format!("role:{role:?}")
+            },
             title: title.to_owned(),
             shortcut,
             enabled: true,
+            checked: false,
+            emit: false,
             role: Some(role),
             handler: None,
         }
@@ -182,6 +254,35 @@ impl MenuItem {
             *handler = Some(Arc::new(f));
         }
         self
+    }
+
+    /// Shows a check mark next to the item.
+    pub fn checked(mut self, is_checked: bool) -> Self {
+        if let Self::Action { checked, .. } = &mut self {
+            *checked = is_checked;
+        }
+        self
+    }
+
+    /// Clicking the item (or pressing its shortcut) emits `menu:<id>` to the
+    /// focused window's webviews, heard in JS with `ipc.menu.on(id, ..)`, and
+    /// [`Event::Menu`](crate::event::Event::Menu)`(id)` to the app.
+    ///
+    /// ```ignore
+    /// MenuItem::new("toggle_panel", "Toggle Panel").shortcut(Shortcut::ctrl("`")).emit()
+    /// ```
+    pub fn emit(mut self) -> Self {
+        if let Self::Action { emit, .. } = &mut self {
+            *emit = true;
+        }
+        self
+    }
+}
+
+impl Shortcut {
+    /// `Ctrl+<key>` on every platform (not Cmd on macOS).
+    pub fn ctrl(key: impl Into<String>) -> Self {
+        Self::new(Mod::CTRL, key)
     }
 }
 
@@ -235,13 +336,18 @@ impl Menu {
         self
     }
 
-    /// Standard OS application + Edit + Window menu so `Cmd+C`/`V`/`X`/`A`/`Z`/`Q`/`W`/`M`
-    /// work automatically out of the box in `WKWebView` and CEF inputs.
+    /// Standard App, Edit, View, Window and Help menus, so `Cmd+C`/`V`/`X`/`A`/`Z`/`Q`/`W`/`M`
+    /// and page zoom (`Cmd+0`/`=`/`-`) work out of the box in `WKWebView` and CEF.
+    ///
+    /// Add a Settings item with [`with_settings`](Self::with_settings). On macOS the
+    /// Help menu gets the system's menu search field.
     pub fn standard() -> Self {
         Self::new()
             .submenu(
                 Submenu::new("App")
                     .item(MenuItem::role(Role::About))
+                    .separator()
+                    .item(MenuItem::role(Role::Services))
                     .separator()
                     .item(MenuItem::role(Role::Hide))
                     .item(MenuItem::role(Role::HideOthers))
@@ -260,12 +366,156 @@ impl Menu {
                     .item(MenuItem::role(Role::SelectAll)),
             )
             .submenu(
+                Submenu::new("View")
+                    .item(MenuItem::role(Role::ActualSize))
+                    .item(MenuItem::role(Role::ZoomIn))
+                    .item(MenuItem::role(Role::ZoomOut))
+                    .separator()
+                    .item(MenuItem::role(Role::Fullscreen)),
+            )
+            .submenu(
                 Submenu::new("Window")
                     .item(MenuItem::role(Role::Minimize))
                     .item(MenuItem::role(Role::Zoom))
-                    .item(MenuItem::role(Role::Fullscreen))
                     .separator()
-                    .item(MenuItem::role(Role::CloseWindow)),
+                    .item(MenuItem::role(Role::CloseWindow))
+                    .separator()
+                    .item(MenuItem::role(Role::BringAllToFront)),
             )
+            .submenu(Submenu::new("Help"))
+    }
+
+    /// Adds "Settings…" (Cmd+,) after "About" in the first (app) menu.
+    pub fn with_settings(mut self) -> Self {
+        if let Some(app) = self.submenus.first_mut() {
+            let at = app
+                .items
+                .iter()
+                .position(|i| matches!(i, MenuItem::Action { role: Some(Role::About), .. }))
+                .map_or(0, |p| p + 1);
+            app.items.insert(at, MenuItem::Separator);
+            app.items.insert(at + 1, MenuItem::role(Role::Settings));
+        }
+        self
+    }
+
+    /// Adds a submenu before the Window menu (or at the end), e.g. an app's
+    /// File or Go menu alongside the standard ones.
+    pub fn insert_submenu(mut self, submenu: Submenu) -> Self {
+        let at = self
+            .submenus
+            .iter()
+            .position(|s| s.title.eq_ignore_ascii_case("Window"))
+            .unwrap_or(self.submenus.len());
+        self.submenus.insert(at, submenu);
+        self
+    }
+}
+
+/// Changes to apply to a menu item after the menu is built: see
+/// [`App::menu_item`](crate::App::menu_item) and `ipc.menu.set(..)` in JS.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MenuItemUpdate {
+    pub title: Option<String>,
+    pub enabled: Option<bool>,
+    pub checked: Option<bool>,
+}
+
+/// Handle to one item of the current app menu, by id.
+#[derive(Clone)]
+pub struct MenuItemHandle {
+    pub(crate) id: String,
+    pub(crate) runtime: Arc<crate::backend::Runtime>,
+}
+
+impl MenuItemHandle {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn set_title(&self, title: impl Into<String>) {
+        self.update(MenuItemUpdate {
+            title: Some(title.into()),
+            ..Default::default()
+        });
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.update(MenuItemUpdate {
+            enabled: Some(enabled),
+            ..Default::default()
+        });
+    }
+
+    pub fn set_checked(&self, checked: bool) {
+        self.update(MenuItemUpdate {
+            checked: Some(checked),
+            ..Default::default()
+        });
+    }
+
+    pub fn update(&self, update: MenuItemUpdate) {
+        self.runtime.update_menu_item(self.id.clone(), update);
+    }
+}
+
+impl std::fmt::Debug for MenuItemHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MenuItemHandle").field("id", &self.id).finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roles(sub: &Submenu) -> Vec<Option<Role>> {
+        sub.items
+            .iter()
+            .filter_map(|i| match i {
+                MenuItem::Action { role, .. } => Some(*role),
+                MenuItem::Separator => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn standard_menu_layout() {
+        let m = Menu::standard();
+        let titles: Vec<&str> = m.submenus.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["App", "Edit", "View", "Window", "Help"]);
+        assert!(roles(&m.submenus[0]).contains(&Some(Role::Services)));
+        assert!(!roles(&m.submenus[0]).contains(&Some(Role::Settings)));
+        assert_eq!(
+            roles(&m.submenus[2]),
+            [
+                Some(Role::ActualSize),
+                Some(Role::ZoomIn),
+                Some(Role::ZoomOut),
+                Some(Role::Fullscreen)
+            ]
+        );
+        assert!(m.submenus[4].items.is_empty());
+    }
+
+    #[test]
+    fn settings_emit_checked_and_insert() {
+        let m = Menu::standard()
+            .with_settings()
+            .insert_submenu(Submenu::new("Go").item(MenuItem::new("panel", "Panel").emit().checked(true)));
+        let app = roles(&m.submenus[0]);
+        assert_eq!(&app[..2], &[Some(Role::About), Some(Role::Settings)]);
+        let MenuItem::Action { id, shortcut, .. } = &m.submenus[0].items[2] else {
+            panic!("expected Settings after a separator");
+        };
+        assert_eq!(id, "settings");
+        assert_eq!(shortcut, &Some(Shortcut::cmd(",")));
+
+        let titles: Vec<&str> = m.submenus.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["App", "Edit", "View", "Go", "Window", "Help"]);
+        let MenuItem::Action { emit, checked, .. } = &m.submenus[3].items[0] else {
+            panic!("expected an action");
+        };
+        assert!(*emit && *checked);
     }
 }

@@ -19,16 +19,17 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use crate::app::App;
+use crate::call::CallState;
 use crate::dialog::{FileDialogKind, FileDialogSpec, MessageDialogSpec, MessageResult};
 use crate::event::{Event, WebViewEvent, WindowEvent};
 use crate::ipc::{
-    ClientSendPacket, Value, decode_base64, decode_rpc_request, decode_send_packet, encode_base64,
+    CallSpec, ClientSendPacket, Value, decode_base64, decode_rpc_request, decode_send_packet, encode_base64,
     encode_event_batch, encode_event_frame, encode_rpc_response, parse,
 };
-use crate::menu::Menu;
+use crate::menu::{Menu, MenuItemUpdate, Role};
 use crate::platform::{RawWebViewHandle, RawWindowHandle};
 use crate::webview::{
-    Ctx, EventHandler, LoadState, Response, RpcHandler, WebView, WebViewEventHandler, WebViewId,
+    Ctx, EventHandler, LoadState, Response, RpcHandler, RpcKind, RpcOutcome, WebView, WebViewEventHandler, WebViewId,
     WebViewSpec,
 };
 use crate::window::{Bounds, Display, Theme, Window, WindowId, WindowSpec, WindowState};
@@ -123,7 +124,11 @@ fn extract_scheme_path(url: &str) -> &str {
 
 pub(crate) enum IpcRouteAction {
     Immediate(Response),
-    AsyncRpc { method: String, arg: Value },
+    AsyncRpc {
+        method: String,
+        arg: Value,
+        call: CallSpec,
+    },
 }
 
 pub(crate) enum IpcReplyTarget {
@@ -200,6 +205,7 @@ pub(crate) enum IncomingIpcJob {
         id: WebViewId,
         method: String,
         arg: Value,
+        call: CallSpec,
         responder: IpcResponder,
     },
 }
@@ -264,7 +270,7 @@ impl IpcEndpoint {
                 Err(_) => IpcRouteAction::Immediate(ipc_binary_response(400, Vec::new())),
             },
             "/rpc" => match decode_rpc_request(body) {
-                Ok((method, arg)) => IpcRouteAction::AsyncRpc { method, arg },
+                Ok((method, arg, call)) => IpcRouteAction::AsyncRpc { method, arg, call },
                 Err(err) => IpcRouteAction::Immediate(ipc_binary_response(
                     200,
                     encode_rpc_response(Err(err.to_string())),
@@ -278,6 +284,7 @@ impl IpcEndpoint {
         &self,
         method: String,
         arg: Value,
+        call: CallSpec,
         responder: IpcResponder,
     ) -> std::result::Result<(), IpcResponder> {
         let Some(rt) = self.runtime.upgrade() else {
@@ -288,6 +295,7 @@ impl IpcEndpoint {
                 id: self.id,
                 method,
                 arg,
+                call,
                 responder,
             });
         }
@@ -312,7 +320,35 @@ struct WebViewDispatchRecord {
     events: BTreeMap<String, EventHandler>,
     msg_handlers: Vec<EventHandler>,
     on_event: Option<WebViewEventHandler>,
+    /// Last page zoom set through `set_zoom` or the View menu.
+    zoom: f64,
 }
+
+/// Page zoom steps for the View menu's Zoom In / Zoom Out, as browsers use.
+const ZOOM_STEPS: [f64; 13] = [
+    0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0,
+];
+
+pub(crate) fn next_zoom_step(current: f64, zoom_in: bool) -> f64 {
+    const EPS: f64 = 1e-3;
+    if zoom_in {
+        ZOOM_STEPS
+            .iter()
+            .copied()
+            .find(|z| *z > current + EPS)
+            .unwrap_or(ZOOM_STEPS[ZOOM_STEPS.len() - 1])
+    } else {
+        ZOOM_STEPS
+            .iter()
+            .rev()
+            .copied()
+            .find(|z| *z < current - EPS)
+            .unwrap_or(ZOOM_STEPS[0])
+    }
+}
+
+/// Built-in page calls handled by the runtime, ahead of app RPCs.
+const BUILTIN_MENU_SET: &str = "ui:menu.set";
 
 type AppEventSlot = Mutex<Option<Box<dyn FnMut(Event) + Send>>>;
 
@@ -326,6 +362,8 @@ pub(crate) struct Runtime {
     ipc_jobs: Mutex<VecDeque<IncomingIpcJob>>,
     app_event: AppEventSlot,
     webviews: Mutex<HashMap<WebViewId, WebViewDispatchRecord>>,
+    /// Calls running on worker threads, keyed by webview and page call id.
+    calls: Mutex<HashMap<(WebViewId, u32), Arc<CallState>>>,
 }
 
 struct WebViewDispatchSnapshot {
@@ -347,6 +385,7 @@ impl Runtime {
             ipc_jobs: Mutex::new(VecDeque::new()),
             app_event: Mutex::new(None),
             webviews: Mutex::new(HashMap::new()),
+            calls: Mutex::new(HashMap::new()),
         })
     }
 
@@ -456,6 +495,76 @@ impl Runtime {
                 Vec::new()
             }
         })
+    }
+
+    pub fn update_menu_item(self: &Arc<Self>, id: String, update: MenuItemUpdate) {
+        let f = move || {
+            #[cfg(target_os = "macos")]
+            macos_appkit::update_menu_item(&id, &update);
+            #[cfg(not(target_os = "macos"))]
+            let _ = (&id, &update);
+        };
+        if self.is_main() {
+            f();
+        } else {
+            self.dispatch_on_main(Box::new(f));
+        }
+    }
+
+    /// Webviews in the window that has keyboard focus.
+    fn focused_webviews(&self) -> Vec<WebViewId> {
+        #[cfg(target_os = "macos")]
+        let focused = macos_appkit::key_window_id();
+        #[cfg(not(target_os = "macos"))]
+        let focused: Option<WindowId> = None;
+        let Some(win) = focused else {
+            return Vec::new();
+        };
+        let mut ids: Vec<WebViewId> = self
+            .webviews
+            .lock()
+            .map(|g| {
+                g.iter()
+                    .filter(|(_, r)| r.window_id == win)
+                    .map(|(id, _)| *id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_menu_command(self: &Arc<Self>, cmd: macos_appkit::MenuCommand) {
+        use macos_appkit::MenuCommand;
+        let targets = self.focused_webviews();
+        match cmd {
+            MenuCommand::Emit(id) => {
+                for wv in &targets {
+                    self.webview_emit(*wv, format!("menu:{id}"), Value::Null);
+                }
+                self.emit_app_event(Event::Menu(id));
+            }
+            MenuCommand::Role(role) => {
+                let Some(&wv) = targets.first() else {
+                    return;
+                };
+                match role {
+                    Role::Reload => self.webview_reload(wv),
+                    Role::Back => self.webview_go_back(wv),
+                    Role::Forward => self.webview_go_forward(wv),
+                    Role::ActualSize => self.webview_set_zoom(wv, 1.0),
+                    Role::ZoomIn | Role::ZoomOut => {
+                        let next = next_zoom_step(self.webview_zoom(wv), role == Role::ZoomIn);
+                        self.webview_set_zoom(wv, next);
+                    }
+                    Role::ToggleDevTools => {
+                        let _ = self.webview_open_devtools(wv);
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     pub fn set_menu(self: &Arc<Self>, menu: Menu) {
@@ -642,8 +751,24 @@ impl Runtime {
     }
 
     fn cleanup_webviews_for_window(&self, win_id: WindowId) {
+        let mut removed = Vec::new();
         if let Ok(mut g) = self.webviews.lock() {
-            g.retain(|_, rec| rec.window_id != win_id);
+            g.retain(|id, rec| {
+                let keep = rec.window_id != win_id;
+                if !keep {
+                    removed.push(*id);
+                }
+                keep
+            });
+        }
+        if let Ok(mut calls) = self.calls.lock() {
+            calls.retain(|(wv, _), state| {
+                let keep = !removed.contains(wv);
+                if !keep {
+                    state.cancel();
+                }
+                keep
+            });
         }
         match self.engine {
             #[cfg(target_os = "macos")]
@@ -725,6 +850,7 @@ impl Runtime {
                     events: spec.events.clone(),
                     msg_handlers: spec.msg_handlers.clone(),
                     on_event: spec.on_event.clone(),
+                    zoom: 1.0,
                 },
             );
         }
@@ -827,7 +953,20 @@ impl Runtime {
         }
     }
 
+    pub fn webview_zoom(&self, id: WebViewId) -> f64 {
+        self.webviews
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&id).map(|r| r.zoom))
+            .unwrap_or(1.0)
+    }
+
     pub fn webview_set_zoom(self: &Arc<Self>, id: WebViewId, zoom: f64) {
+        if let Ok(mut g) = self.webviews.lock()
+            && let Some(rec) = g.get_mut(&id)
+        {
+            rec.zoom = zoom;
+        }
         let engine = self.engine;
         let f = move || match engine {
             #[cfg(target_os = "macos")]
@@ -1046,6 +1185,7 @@ impl Runtime {
             app: App {
                 runtime: self.clone(),
             },
+            call: None,
         }
     }
 
@@ -1059,9 +1199,10 @@ impl Runtime {
                     id,
                     method,
                     arg,
+                    call,
                     responder,
                 } => {
-                    self.handle_rpc_job(id, method, arg, responder);
+                    self.handle_rpc_job(id, method, arg, call, responder);
                 }
             }
         }
@@ -1075,6 +1216,21 @@ impl Runtime {
         match packet {
             ClientSendPacket::Drag => {
                 self.begin_window_drag(snap.window_id);
+            }
+            ClientSendPacket::TitlebarDoubleClick => {
+                // Zoom or minimize, per "Double-click a window's title bar to…".
+                #[cfg(target_os = "macos")]
+                macos_appkit::titlebar_double_click(snap.window_id);
+            }
+            ClientSendPacket::Cancel(call_id) => {
+                if let Some(state) = self.call_state(id, call_id) {
+                    state.cancel();
+                }
+            }
+            ClientSendPacket::StreamData(call_id, data) => {
+                if let Some(state) = self.call_state(id, call_id) {
+                    state.push_inbound(data);
+                }
             }
             ClientSendPacket::Event(name, data) => {
                 if let Some(handler) = snap.events.get(&name) {
@@ -1107,31 +1263,123 @@ impl Runtime {
         }
     }
 
+    fn call_state(&self, id: WebViewId, call_id: u32) -> Option<Arc<CallState>> {
+        self.calls
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&(id, call_id)).cloned())
+    }
+
     fn handle_rpc_job(
         self: &Arc<Self>,
         id: WebViewId,
         method: String,
         arg: Value,
+        call: CallSpec,
         responder: IpcResponder,
     ) {
+        let reply = |responder: IpcResponder, result: std::result::Result<Value, String>| {
+            responder.finish(ipc_binary_response(200, encode_rpc_response(result)));
+        };
         let Some(snap) = self.dispatch_info(id) else {
-            responder.finish(ipc_binary_response(
-                200,
-                encode_rpc_response(Err("webview closed".to_owned())),
-            ));
+            reply(responder, Err("webview closed".to_owned()));
             return;
         };
-        let ctx = self.make_ctx(snap.window_id, id);
-        let result = if let Some(handler) = snap.rpcs.get(&method) {
-            if let Ok(mut guard) = handler.lock() {
-                guard(ctx, arg)
-            } else {
-                Err("RPC handler mutex poisoned".to_owned())
-            }
-        } else {
-            Err(format!("unknown RPC method: {method}"))
+        if method == BUILTIN_MENU_SET {
+            let update = || -> std::result::Result<Value, String> {
+                let id = arg
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or("ipc.menu.set needs an \"id\"")?
+                    .to_owned();
+                let update = MenuItemUpdate {
+                    title: arg.get("title").and_then(Value::as_str).map(str::to_owned),
+                    enabled: arg.get("enabled").and_then(Value::as_bool),
+                    checked: arg.get("checked").and_then(Value::as_bool),
+                };
+                #[cfg(target_os = "macos")]
+                let found = macos_appkit::update_menu_item(&id, &update);
+                #[cfg(not(target_os = "macos"))]
+                let found = {
+                    let _ = update;
+                    false
+                };
+                Ok(Value::Bool(found))
+            };
+            return reply(responder, update());
+        }
+        let Some(handler) = snap.rpcs.get(&method) else {
+            reply(responder, Err(format!("unknown RPC method: {method}")));
+            return;
         };
-        responder.finish(ipc_binary_response(200, encode_rpc_response(result)));
+        match (handler.kind, call.stream) {
+            (RpcKind::Stream, false) => {
+                return reply(
+                    responder,
+                    Err(format!("\"{method}\" is a stream; open it with ipc.stream()")),
+                );
+            }
+            (RpcKind::Main | RpcKind::Blocking, true) => {
+                return reply(
+                    responder,
+                    Err(format!("\"{method}\" is not a stream; call it with ipc.invoke()")),
+                );
+            }
+            _ => {}
+        }
+        let mut ctx = self.make_ctx(snap.window_id, id);
+        let state = call.id.map(|call_id| (call_id, Arc::new(CallState::new())));
+        ctx.call = state.clone();
+        let outcome = match handler.func.lock() {
+            Ok(mut f) => f(ctx, arg),
+            Err(_) => RpcOutcome::Ready(Err("RPC handler mutex poisoned".to_owned())),
+        };
+        let job = match outcome {
+            RpcOutcome::Ready(result) => return reply(responder, result),
+            RpcOutcome::Worker(job) => job,
+        };
+
+        let key = state.as_ref().map(|(call_id, _)| (id, *call_id));
+        if let (Some(key), Some((_, st))) = (key, &state)
+            && let Ok(mut calls) = self.calls.lock()
+        {
+            calls.insert(key, Arc::clone(st));
+        }
+        let rt = Arc::clone(self);
+        // The responder is finished on the UI thread: WebKit scheme tasks live there.
+        let finish = move |responder: IpcResponder, result: std::result::Result<Value, String>| {
+            let main_rt = Arc::clone(&rt);
+            rt.dispatch_on_main(Box::new(move || {
+                if let Some(key) = key
+                    && let Ok(mut calls) = main_rt.calls.lock()
+                {
+                    calls.remove(&key);
+                }
+                responder.finish(ipc_binary_response(200, encode_rpc_response(result)));
+            }));
+        };
+        // `spawn` hands the closure back only on success, so keep the responder
+        // reachable from here for the failure path.
+        let slot = Arc::new(Mutex::new(Some((responder, job))));
+        let worker_slot = Arc::clone(&slot);
+        let worker_finish = finish.clone();
+        let spawned = thread::Builder::new()
+            .name(format!("ui-invoke:{method}"))
+            .spawn(move || {
+                let Some((responder, job)) =
+                    worker_slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+                else {
+                    return;
+                };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+                    .unwrap_or_else(|_| Err(format!("\"{method}\" handler panicked")));
+                worker_finish(responder, result);
+            });
+        if let Err(err) = spawned
+            && let Some((responder, _)) = slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+        {
+            finish(responder, Err(format!("could not start worker thread: {err}")));
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1157,7 +1405,9 @@ impl Runtime {
                     call_id,
                 });
                 match decode_rpc_request(&bytes) {
-                    Ok((method, arg)) => self.handle_rpc_job(id, method, arg, responder),
+                    Ok((method, arg, call)) => {
+                        self.handle_rpc_job(id, method, arg, call, responder)
+                    }
                     Err(err) => responder.finish(ipc_binary_response(
                         200,
                         encode_rpc_response(Err(err.to_string())),
@@ -1257,6 +1507,10 @@ where
                 runtime.drain_queue();
                 runtime.drain_ipc_jobs();
 
+                for cmd in macos_appkit::drain_menu_commands() {
+                    runtime.handle_menu_command(cmd);
+                }
+
                 macos_appkit::drain_queued_events(|ev| {
                     if let Event::Window(win_id, WindowEvent::Closed) = &ev {
                         runtime.cleanup_webviews_for_window(*win_id);
@@ -1299,5 +1553,45 @@ where
         Err(Error::Unsupported(
             "native host window loop not yet implemented for this OS",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_zoom_step;
+
+    #[test]
+    fn zoom_steps_move_one_step_and_clamp() {
+        assert_eq!(next_zoom_step(1.0, true), 1.1);
+        assert_eq!(next_zoom_step(1.0, false), 0.9);
+        // Off-grid values snap to the next step in that direction.
+        assert_eq!(next_zoom_step(1.05, true), 1.1);
+        assert_eq!(next_zoom_step(1.05, false), 1.0);
+        assert_eq!(next_zoom_step(3.0, true), 3.0);
+        assert_eq!(next_zoom_step(0.5, false), 0.5);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn titlebar_double_click_follows_system_setting() {
+        use super::macos_appkit::{TitlebarAction, titlebar_action_for};
+        assert_eq!(titlebar_action_for(None, false), TitlebarAction::Zoom);
+        assert_eq!(titlebar_action_for(None, true), TitlebarAction::Minimize);
+        assert_eq!(titlebar_action_for(Some("Maximize"), true), TitlebarAction::Zoom);
+        assert_eq!(titlebar_action_for(Some("Fill"), false), TitlebarAction::Zoom);
+        assert_eq!(titlebar_action_for(Some("Minimize"), false), TitlebarAction::Minimize);
+        assert_eq!(titlebar_action_for(Some("None"), false), TitlebarAction::None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn role_titles_include_the_app_name() {
+        use super::macos_appkit::role_title_with_app;
+        use crate::menu::Role;
+        assert_eq!(role_title_with_app(Role::Quit, "Quit", "Notes").as_deref(), Some("Quit Notes"));
+        assert_eq!(role_title_with_app(Role::Help, "Help", "Notes").as_deref(), Some("Notes Help"));
+        // Custom titles are left alone.
+        assert_eq!(role_title_with_app(Role::Quit, "Exit", "Notes"), None);
+        assert_eq!(role_title_with_app(Role::Copy, "Copy", "Notes"), None);
     }
 }

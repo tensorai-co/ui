@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::app::App;
 use crate::backend::Runtime;
+use crate::call::{CallState, STREAM_DATA_PREFIX, STREAM_END_PREFIX, Stream};
 use crate::event::WebViewEvent;
 use crate::ipc::{FromIpc, IntoIpc, RpcResult, Value};
 use crate::platform::RawWebViewHandle;
@@ -291,12 +292,14 @@ impl Response {
     }
 }
 
-/// Context passed to every `.rpc`, `.on`, `.on_msg`, and lifecycle handler.
+/// Context passed to every `.invoke`, `.on`, `.on_msg`, and lifecycle handler.
 #[derive(Clone)]
 pub struct Ctx {
     pub(crate) window: Window,
     pub(crate) webview: WebView,
     pub(crate) app: App,
+    /// Call id and state, for calls the page made with an id (cancellable or streams).
+    pub(crate) call: Option<(u32, Arc<CallState>)>,
 }
 
 impl Ctx {
@@ -315,11 +318,47 @@ impl Ctx {
     pub fn emit(&self, event: &str, payload: impl IntoIpc) {
         self.webview.emit(event, payload);
     }
+
+    /// True once the page gave up on this call: its `AbortSignal` fired, its
+    /// `timeout` passed, it closed the stream, or the webview went away.
+    ///
+    /// Long `invoke_blocking` / `invoke_stream` handlers should check this
+    /// between steps and return early. Always false for `.invoke` handlers and
+    /// for calls made without `{ signal }` / `{ timeout }`.
+    pub fn is_cancelled(&self) -> bool {
+        self.call.as_ref().is_some_and(|(_, c)| c.is_cancelled())
+    }
 }
 
 pub(crate) type AssetHandler = Arc<dyn Fn(&Request) -> Response + Send + Sync>;
-pub(crate) type RpcHandler =
-    Arc<Mutex<Box<dyn FnMut(Ctx, Value) -> std::result::Result<Value, String> + Send>>>;
+
+/// How a registered RPC runs, checked against how the page called it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RpcKind {
+    /// `.invoke`: runs on the UI thread.
+    Main,
+    /// `.invoke_blocking`: runs on a worker thread.
+    Blocking,
+    /// `.invoke_stream`: runs on a worker thread with a `Stream`.
+    Stream,
+}
+
+/// What an RPC handler produced on the UI thread.
+pub(crate) enum RpcOutcome {
+    /// The reply, computed on the UI thread.
+    Ready(std::result::Result<Value, String>),
+    /// Work to run on a worker thread; its result is the reply.
+    Worker(Box<dyn FnOnce() -> std::result::Result<Value, String> + Send>),
+}
+
+type RpcFn = Box<dyn FnMut(Ctx, Value) -> RpcOutcome + Send>;
+
+pub(crate) struct RpcEntry {
+    pub kind: RpcKind,
+    pub func: Mutex<RpcFn>,
+}
+
+pub(crate) type RpcHandler = Arc<RpcEntry>;
 pub(crate) type EventHandler = Arc<Mutex<Box<dyn FnMut(Ctx, Value) + Send>>>;
 pub(crate) type NavHandler = Arc<Mutex<Box<dyn FnMut(&NavRequest) -> Nav + Send>>>;
 pub(crate) type WebViewEventHandler = Arc<Mutex<Box<dyn FnMut(WebViewEvent) + Send>>>;
@@ -488,19 +527,129 @@ impl WebViewBuilder {
         self
     }
 
-    /// Registers a typed async request/response RPC exposed to JS as `ipc.invoke(name, ...)`.
-    pub fn rpc<A, R, F>(mut self, name: impl Into<String>, mut handler: F) -> Self
+    /// Registers a typed request/response call exposed to JS as `ipc.invoke(name, ...)`.
+    ///
+    /// The handler runs on the UI thread, so it must return quickly. Use
+    /// [`invoke_blocking`](Self::invoke_blocking) for slow work.
+    pub fn invoke<A, R, F>(mut self, name: impl Into<String>, mut handler: F) -> Self
     where
         A: FromIpc,
         R: RpcResult,
         F: FnMut(Ctx, A) -> R + Send + 'static,
     {
-        let boxed: RpcHandler = Arc::new(Mutex::new(Box::new(move |ctx, val| {
-            let arg = A::from_ipc(&val).map_err(|e| e.to_string())?;
-            handler(ctx, arg).into_rpc_result()
-        })));
-        self.spec.rpcs.insert(name.into(), boxed);
+        let func: RpcFn = Box::new(move |ctx, val| {
+            RpcOutcome::Ready(
+                A::from_ipc(&val)
+                    .map_err(|e| e.to_string())
+                    .and_then(|arg| handler(ctx, arg).into_rpc_result()),
+            )
+        });
+        self.insert_rpc(name.into(), RpcKind::Main, func);
         self
+    }
+
+    /// Same as [`invoke`](Self::invoke); kept under its v1 name.
+    pub fn rpc<A, R, F>(self, name: impl Into<String>, handler: F) -> Self
+    where
+        A: FromIpc,
+        R: RpcResult,
+        F: FnMut(Ctx, A) -> R + Send + 'static,
+    {
+        self.invoke(name, handler)
+    }
+
+    /// Registers a call that runs on a worker thread, exposed to JS as
+    /// `ipc.invoke(name, ...)`. The page's promise resolves when the handler returns.
+    ///
+    /// Use it for anything slow (builds, scans, network). Calls run concurrently,
+    /// each on its own thread, so the handler is `Fn + Sync`. The page can pass
+    /// `{ signal, timeout }` as the last argument; check
+    /// [`Ctx::is_cancelled`] to stop early.
+    ///
+    /// ```ignore
+    /// .invoke_blocking("export_report", |ctx, req: ExportRequest| reports.export(&ctx, req))
+    /// ```
+    pub fn invoke_blocking<A, R, F>(mut self, name: impl Into<String>, handler: F) -> Self
+    where
+        A: FromIpc + Send + 'static,
+        R: RpcResult,
+        F: Fn(Ctx, A) -> R + Send + Sync + 'static,
+    {
+        let handler = Arc::new(handler);
+        let func: RpcFn = Box::new(move |ctx, val| match A::from_ipc(&val) {
+            Ok(arg) => {
+                let handler = Arc::clone(&handler);
+                RpcOutcome::Worker(Box::new(move || handler(ctx, arg).into_rpc_result()))
+            }
+            Err(e) => RpcOutcome::Ready(Err(e.to_string())),
+        });
+        self.insert_rpc(name.into(), RpcKind::Blocking, func);
+        self
+    }
+
+    /// Registers a streaming call, opened from JS with `ipc.stream(name, ...)`.
+    ///
+    /// The handler runs on a worker thread with a [`Stream`]: `stream.send(..)`
+    /// delivers frames to the page's `on("data")` listeners in order, and
+    /// `stream.recv()` reads what the page sends back. The return value
+    /// resolves the page's `stream.closed`.
+    ///
+    /// ```ignore
+    /// .invoke_stream("tail", |_ctx, path: String, stream| {
+    ///     for line in follow(&path) {
+    ///         if stream.send(line).is_err() { break } // page closed it
+    ///     }
+    ///     stream.close_with(0)
+    /// })
+    /// ```
+    pub fn invoke_stream<A, R, F>(mut self, name: impl Into<String>, handler: F) -> Self
+    where
+        A: FromIpc + Send + 'static,
+        R: RpcResult,
+        F: Fn(Ctx, A, Stream) -> R + Send + Sync + 'static,
+    {
+        let handler = Arc::new(handler);
+        let func: RpcFn = Box::new(move |ctx, val| {
+            let Some((id, state)) = ctx.call.clone() else {
+                return RpcOutcome::Ready(Err("stream call without a call id".into()));
+            };
+            let Some(inbound) = state.take_inbound() else {
+                return RpcOutcome::Ready(Err("stream already opened".into()));
+            };
+            let arg = match A::from_ipc(&val) {
+                Ok(arg) => arg,
+                Err(e) => return RpcOutcome::Ready(Err(e.to_string())),
+            };
+            let handler = Arc::clone(&handler);
+            RpcOutcome::Worker(Box::new(move || {
+                let webview = ctx.webview();
+                let stream = Stream {
+                    webview: webview.clone(),
+                    data_channel: format!("{STREAM_DATA_PREFIX}{id}"),
+                    state,
+                    inbound,
+                };
+                let end = match handler(ctx, arg, stream).into_rpc_result() {
+                    Ok(v) => BTreeMap::from([("ok".to_owned(), v)]),
+                    Err(e) => BTreeMap::from([("error".to_owned(), Value::String(e))]),
+                };
+                // Sent through the same event queue as the data, so it arrives last.
+                webview.emit(&format!("{STREAM_END_PREFIX}{id}"), Value::Object(end));
+                Ok(Value::Null)
+            }))
+        });
+        self.insert_rpc(name.into(), RpcKind::Stream, func);
+        self
+    }
+
+    fn insert_rpc(&mut self, name: String, kind: RpcKind, func: RpcFn) {
+        self.spec.rpcs.insert(
+            name,
+            Arc::new(RpcEntry {
+                kind,
+                func: Mutex::new(func),
+            }),
+        );
     }
 
     /// Registers a typed fire-and-forget event listener for `ipc.send(event, ...)`.
@@ -607,6 +756,11 @@ impl WebView {
 
     pub fn set_zoom(&self, zoom: f64) {
         self.runtime.webview_set_zoom(self.id, zoom);
+    }
+
+    /// The page zoom last set with `set_zoom` or the View menu (1.0 = 100%).
+    pub fn zoom(&self) -> f64 {
+        self.runtime.webview_zoom(self.id)
     }
 
     pub fn set_inspectable(&self, inspectable: bool) {

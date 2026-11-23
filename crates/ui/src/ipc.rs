@@ -1197,6 +1197,73 @@ macro_rules! ipc_enum {
     };
 }
 
+/// Declares a struct that crosses IPC as a JS object, with `FromIpc` and `IntoIpc`
+/// generated field by field.
+///
+/// ```ignore
+/// ui::ipc_struct! {
+///     #[derive(Debug, Clone)]
+///     pub struct ExportRequest { pub path: String, pub pages: Option<u32> }
+/// }
+/// ```
+///
+/// A missing field decodes as `null`, so `Option<T>` fields are optional and every
+/// other field reports `missing IPC field "name"`. Decode errors name the field.
+#[macro_export]
+macro_rules! ipc_struct {
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident {
+            $( $(#[$fmeta:meta])* $fvis:vis $field:ident : $ty:ty ),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        $vis struct $name {
+            $( $(#[$fmeta])* $fvis $field : $ty ),*
+        }
+
+        impl $crate::ipc::FromIpc for $name {
+            fn from_ipc(value: &$crate::ipc::Value) -> ::std::result::Result<Self, $crate::ipc::DecodeError> {
+                if !::std::matches!(value, $crate::ipc::Value::Object(_)) {
+                    return ::std::result::Result::Err($crate::ipc::DecodeError::new(
+                        ::std::concat!("expected an object for ", ::std::stringify!($name)),
+                    ));
+                }
+                ::std::result::Result::Ok(Self {
+                    $(
+                        $field: match value.get(::std::stringify!($field)) {
+                            ::std::option::Option::Some(v) => <$ty as $crate::ipc::FromIpc>::from_ipc(v).map_err(|e| {
+                                $crate::ipc::DecodeError::new(::std::format!(
+                                    ::std::concat!("IPC field \"", ::std::stringify!($field), "\": {}"),
+                                    e
+                                ))
+                            })?,
+                            ::std::option::Option::None => <$ty as $crate::ipc::FromIpc>::from_ipc(&$crate::ipc::Value::Null)
+                                .map_err(|_| $crate::ipc::DecodeError::new(
+                                    ::std::concat!("missing IPC field \"", ::std::stringify!($field), "\""),
+                                ))?,
+                        },
+                    )*
+                })
+            }
+        }
+
+        impl $crate::ipc::IntoIpc for $name {
+            fn into_ipc(self) -> $crate::ipc::Value {
+                #[allow(unused_mut)]
+                let mut map = ::std::collections::BTreeMap::new();
+                $(
+                    map.insert(
+                        ::std::string::String::from(::std::stringify!($field)),
+                        $crate::ipc::IntoIpc::into_ipc(self.$field),
+                    );
+                )*
+                $crate::ipc::Value::Object(map)
+            }
+        }
+    };
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __ipc_enum_decode {
@@ -1231,12 +1298,35 @@ const MAX_WIRE_DEPTH: usize = 64;
 const SEND_OP_EVENT: u8 = 0x01;
 const SEND_OP_MSG: u8 = 0x02;
 const SEND_OP_DRAG: u8 = 0x03;
+const SEND_OP_TITLEBAR_DOUBLE_CLICK: u8 = 0x04;
+const SEND_OP_CANCEL: u8 = 0x05;
+const SEND_OP_STREAM_DATA: u8 = 0x06;
+
+/// RPC flag: a little-endian `u32` call id follows the flags byte.
+const RPC_FLAG_CALL_ID: u8 = 0x01;
+/// RPC flag: the call is an `ipc.stream(..)`; requires `RPC_FLAG_CALL_ID`.
+const RPC_FLAG_STREAM: u8 = 0x02;
+
+/// Per-call metadata carried by an RPC packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct CallSpec {
+    /// Page-assigned id, present when the call can be cancelled or is a stream.
+    pub id: Option<u32>,
+    /// True for `ipc.stream(..)` calls.
+    pub stream: bool,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ClientSendPacket {
     Event(String, Value),
     Msg(Value),
     Drag,
+    /// A double click on a `data-ui-drag` region: zoom or minimize, per the OS setting.
+    TitlebarDoubleClick,
+    /// The page aborted, timed out, or closed the call with this id.
+    Cancel(u32),
+    /// Data the page wrote into an open `ipc.stream(..)` with this id.
+    StreamData(u32, Value),
 }
 
 struct WireCursor<'a> {
@@ -1428,18 +1518,29 @@ fn decode_wire_value_depth(bytes: &[u8], depth: usize) -> Result<Value, DecodeEr
     }
 }
 
-pub(crate) fn decode_rpc_request(bytes: &[u8]) -> Result<(String, Value), DecodeError> {
+pub(crate) fn decode_rpc_request(bytes: &[u8]) -> Result<(String, Value, CallSpec), DecodeError> {
     let mut cur = WireCursor::new(bytes);
     let flags = cur.read_u8()?;
-    if flags != 0 {
+    if flags & !(RPC_FLAG_CALL_ID | RPC_FLAG_STREAM) != 0
+        || (flags & RPC_FLAG_STREAM != 0 && flags & RPC_FLAG_CALL_ID == 0)
+    {
         return Err(DecodeError::new(format!(
             "unsupported binary RPC flags 0x{flags:02x}"
         )));
     }
+    let id = if flags & RPC_FLAG_CALL_ID != 0 {
+        Some(cur.read_u32_le()?)
+    } else {
+        None
+    };
     let method_len = usize::from(cur.read_u16_le()?);
     let method = cur.read_utf8(method_len)?.to_owned();
     let arg = decode_wire_value(cur.read_rest())?;
-    Ok((method, arg))
+    let call = CallSpec {
+        id,
+        stream: flags & RPC_FLAG_STREAM != 0,
+    };
+    Ok((method, arg, call))
 }
 
 pub(crate) fn encode_rpc_response(result: Result<Value, String>) -> Vec<u8> {
@@ -1475,6 +1576,24 @@ pub(crate) fn decode_send_packet(bytes: &[u8]) -> Result<ClientSendPacket, Decod
                 return Err(DecodeError::new("trailing bytes in drag packet"));
             }
             Ok(ClientSendPacket::Drag)
+        }
+        SEND_OP_TITLEBAR_DOUBLE_CLICK => {
+            if cur.remaining() != 0 {
+                return Err(DecodeError::new("trailing bytes in title-bar packet"));
+            }
+            Ok(ClientSendPacket::TitlebarDoubleClick)
+        }
+        SEND_OP_CANCEL => {
+            let id = cur.read_u32_le()?;
+            if cur.remaining() != 0 {
+                return Err(DecodeError::new("trailing bytes in cancel packet"));
+            }
+            Ok(ClientSendPacket::Cancel(id))
+        }
+        SEND_OP_STREAM_DATA => {
+            let id = cur.read_u32_le()?;
+            let payload = decode_wire_value(cur.read_rest())?;
+            Ok(ClientSendPacket::StreamData(id, payload))
         }
         op => Err(DecodeError::new(format!(
             "unknown binary send opcode 0x{op:02x}"
@@ -1582,6 +1701,66 @@ pub(crate) fn decode_base64(input: &str) -> Result<Vec<u8>, DecodeError> {
 
 #[cfg(test)]
 mod tests {
+
+    crate::ipc_struct! {
+        #[derive(Debug, Clone, PartialEq)]
+        struct ExportRequest {
+            path: String,
+            pages: Option<u32>,
+        }
+    }
+
+    #[test]
+    fn ipc_struct_round_trip_and_errors() {
+        let req = ExportRequest { path: "a.pdf".into(), pages: Some(3) };
+        let val = req.clone().into_ipc();
+        assert_eq!(ExportRequest::from_ipc(&val).unwrap(), req);
+
+        let mut only_path = std::collections::BTreeMap::new();
+        only_path.insert("path".to_owned(), Value::String("b.pdf".into()));
+        let decoded = ExportRequest::from_ipc(&Value::Object(only_path)).unwrap();
+        assert_eq!(decoded.pages, None);
+
+        let err = ExportRequest::from_ipc(&Value::Object(Default::default())).unwrap_err();
+        assert!(err.to_string().contains("missing IPC field \"path\""), "{err}");
+        assert!(ExportRequest::from_ipc(&Value::Null).is_err());
+    }
+
+    #[test]
+    fn titlebar_double_click_packet() {
+        assert_eq!(decode_send_packet(&[0x04]).unwrap(), ClientSendPacket::TitlebarDoubleClick);
+        assert!(decode_send_packet(&[0x04, 0x00]).is_err());
+    }
+
+    #[test]
+    fn call_id_stream_and_cancel_packets() {
+        let mut rpc = vec![0x03];
+        rpc.extend_from_slice(&7u32.to_le_bytes());
+        rpc.extend_from_slice(&2u16.to_le_bytes());
+        rpc.extend_from_slice(b"go");
+        rpc.push(WIRE_NULL);
+        let (method, arg, call) = decode_rpc_request(&rpc).unwrap();
+        assert_eq!((method.as_str(), arg), ("go", Value::Null));
+        assert_eq!(call, CallSpec { id: Some(7), stream: true });
+
+        // A stream without a call id, and unknown flags, are rejected.
+        assert!(decode_rpc_request(&[0x02, 0, 0, WIRE_NULL]).is_err());
+        assert!(decode_rpc_request(&[0x80, 0, 0, WIRE_NULL]).is_err());
+
+        let mut cancel = vec![0x05];
+        cancel.extend_from_slice(&9u32.to_le_bytes());
+        assert_eq!(decode_send_packet(&cancel).unwrap(), ClientSendPacket::Cancel(9));
+        assert!(decode_send_packet(&[0x05, 1, 0]).is_err());
+
+        let mut data = vec![0x06];
+        data.extend_from_slice(&9u32.to_le_bytes());
+        data.extend_from_slice(&[WIRE_BYTES, 1, 2]);
+        assert_eq!(
+            decode_send_packet(&data).unwrap(),
+            ClientSendPacket::StreamData(9, Value::Bytes(vec![1, 2]))
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1667,8 +1846,9 @@ mod tests {
         rpc.extend_from_slice(&4u16.to_le_bytes());
         rpc.extend_from_slice(b"echo");
         rpc.extend_from_slice(&encode_wire_value(&Value::Bytes(vec![10, 20, 30])));
-        let (method, arg) = decode_rpc_request(&rpc).unwrap();
+        let (method, arg, call) = decode_rpc_request(&rpc).unwrap();
         assert_eq!(method, "echo");
+        assert_eq!(call, CallSpec::default());
         assert_eq!(Bytes::from_ipc(&arg).unwrap().0, vec![10, 20, 30]);
 
         let resp_ok = encode_rpc_response(Ok(Bytes(vec![1, 2]).into_ipc()));

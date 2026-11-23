@@ -19,12 +19,20 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
   const SEND_OP_EVENT = 0x01;
   const SEND_OP_MSG = 0x02;
   const SEND_OP_DRAG = 0x03;
+  const SEND_OP_TITLEBAR_DOUBLE_CLICK = 0x04;
+  const SEND_OP_CANCEL = 0x05;
+  const SEND_OP_STREAM_DATA = 0x06;
+  const RPC_FLAG_CALL_ID = 0x01;
+  const RPC_FLAG_STREAM = 0x02;
+  const STREAM_DATA_PREFIX = "__ui_stream:";
+  const STREAM_END_PREFIX = "__ui_stream_end:";
 
   const enc = new TextEncoder();
   const dec = new TextDecoder();
   const listeners = new Map();
   const pendingFallback = new Map();
   let nextFallbackId = 1;
+  let nextCallId = 1;
   let hasAnyListener = false;
   let draining = false;
   let wakeAgain = false;
@@ -178,16 +186,163 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
     throw new Error("Unknown binary IPC tag: " + tag);
   }
 
-  function encodeRpcPacket(method, arg) {
+  // flags 0: [0][u16 len][method][value]
+  // with a call id: [flags][u32 id][u16 len][method][value]
+  function encodeRpcPacket(method, arg, callId, stream) {
     const mb = enc.encode(String(method));
     const ab = encodeWireValue(arg);
-    const out = new Uint8Array(3 + mb.byteLength + ab.byteLength);
+    const head = callId === undefined ? 1 : 5;
+    const out = new Uint8Array(head + 2 + mb.byteLength + ab.byteLength);
     const dv = new DataView(out.buffer);
-    out[0] = 0;
-    dv.setUint16(1, mb.byteLength, true);
-    out.set(mb, 3);
-    out.set(ab, 3 + mb.byteLength);
+    if (callId === undefined) {
+      out[0] = 0;
+    } else {
+      out[0] = RPC_FLAG_CALL_ID | (stream ? RPC_FLAG_STREAM : 0);
+      dv.setUint32(1, callId, true);
+    }
+    dv.setUint16(head, mb.byteLength, true);
+    out.set(mb, head + 2);
+    out.set(ab, head + 2 + mb.byteLength);
     return out;
+  }
+
+  function encodeCallPacket(op, callId, arg) {
+    const ab = arg === undefined ? new Uint8Array(0) : encodeWireValue(arg);
+    const out = new Uint8Array(5 + ab.byteLength);
+    out[0] = op;
+    new DataView(out.buffer).setUint32(1, callId, true);
+    out.set(ab, 5);
+    return out;
+  }
+
+  function packArgs(args) {
+    return args.length === 0 ? null : (args.length === 1 ? args[0] : args);
+  }
+
+  // A trailing `{ signal, timeout }` object is call options, not an argument.
+  function isCallOptions(v) {
+    if (!v || typeof v !== "object" || Array.isArray(v) || isBinary(v)) return false;
+    if (Object.getPrototypeOf(v) !== Object.prototype) return false;
+    const keys = Object.keys(v);
+    if (keys.length === 0) return false;
+    for (const k of keys) {
+      if (k !== "signal" && k !== "timeout") return false;
+    }
+    const sigOk = v.signal === undefined ||
+      (typeof AbortSignal !== "undefined" && v.signal instanceof AbortSignal);
+    const timeoutOk = v.timeout === undefined || typeof v.timeout === "number";
+    return sigOk && timeoutOk;
+  }
+
+  function abortError(signal) {
+    if (signal && signal.reason !== undefined) return signal.reason;
+    const err = new Error("The IPC call was aborted");
+    err.name = "AbortError";
+    return err;
+  }
+
+  function postRpc(pkt) {
+    if (useWkFallback()) {
+      const id = nextFallbackId++;
+      return new Promise((resolve, reject) => {
+        pendingFallback.set(id, { resolve, reject });
+        window.webkit.messageHandlers.ui.postMessage(
+          JSON.stringify({ kind: "rpc", id, data: bytesToB64(pkt) })
+        );
+      });
+    }
+    return fetch(IPC_BASE + "/rpc", { method: "POST", body: pkt }).then(async (res) => {
+      if (!res.ok) throw new Error("IPC HTTP " + res.status);
+      return decodeRpcResponse(new Uint8Array(await res.arrayBuffer()));
+    });
+  }
+
+  function invokeWithOptions(method, arg, opts) {
+    const signal = opts.signal;
+    if (signal && signal.aborted) return Promise.reject(abortError(signal));
+    const callId = nextCallId++;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timer = null;
+      const cleanup = () => {
+        settled = true;
+        if (timer !== null) clearTimeout(timer);
+        if (signal) signal.removeEventListener("abort", onAbort);
+      };
+      const giveUp = (err) => {
+        if (settled) return;
+        cleanup();
+        sendPacket(encodeCallPacket(SEND_OP_CANCEL, callId));
+        reject(err);
+      };
+      const onAbort = () => giveUp(abortError(signal));
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+      if (typeof opts.timeout === "number" && opts.timeout >= 0) {
+        timer = setTimeout(() => {
+          const err = new Error("IPC call \"" + method + "\" timed out after " + opts.timeout + " ms");
+          err.name = "TimeoutError";
+          giveUp(err);
+        }, opts.timeout);
+      }
+      postRpc(encodeRpcPacket(method, arg, callId, false)).then(
+        (v) => { if (!settled) { cleanup(); resolve(v); } },
+        (e) => { if (!settled) { cleanup(); reject(e); } }
+      );
+    });
+  }
+
+  function openStream(method, args) {
+    const callId = nextCallId++;
+    const dataCh = STREAM_DATA_PREFIX + callId;
+    const endCh = STREAM_END_PREFIX + callId;
+    const dataListeners = new Set();
+    let done = false;
+    let resolveClosed, rejectClosed;
+    const closed = new Promise((res, rej) => { resolveClosed = res; rejectClosed = rej; });
+    // Unobserved rejections of `closed` should not be reported as unhandled.
+    closed.catch(() => {});
+    const offData = api.on(dataCh, (chunk) => {
+      for (const fn of Array.from(dataListeners)) {
+        try { fn(chunk); } catch (e) { console.error("ipc stream listener error:", e); }
+      }
+    });
+    const finish = () => {
+      done = true;
+      offData();
+      offEnd();
+      dataListeners.clear();
+    };
+    const offEnd = api.on(endCh, (end) => {
+      if (done) return;
+      finish();
+      if (end && Object.prototype.hasOwnProperty.call(end, "error")) {
+        rejectClosed(new Error(end.error));
+      } else {
+        resolveClosed(end ? end.ok : null);
+      }
+    });
+    postRpc(encodeRpcPacket(method, packArgs(args), callId, true)).then(
+      () => {},
+      (err) => { if (!done) { finish(); rejectClosed(err); } }
+    );
+    return Object.freeze({
+      id: callId,
+      closed,
+      on(event, fn) {
+        if (event !== "data") throw new TypeError("ipc stream only emits \"data\"");
+        if (typeof fn !== "function") throw new TypeError("ipc listener must be a function");
+        dataListeners.add(fn);
+        return () => dataListeners.delete(fn);
+      },
+      send(...data) {
+        if (done) return;
+        sendPacket(encodeCallPacket(SEND_OP_STREAM_DATA, callId, packArgs(data)));
+      },
+      close() {
+        if (done) return;
+        sendPacket(encodeCallPacket(SEND_OP_CANCEL, callId));
+      }
+    });
   }
 
   function encodeSendEvent(name, arg) {
@@ -342,29 +497,24 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
 
   const api = Object.freeze({
     invoke(method, ...args) {
-      const arg = args.length === 0 ? null : (args.length === 1 ? args[0] : args);
-      const pkt = encodeRpcPacket(method, arg);
-      if (useWkFallback()) {
-        const id = nextFallbackId++;
-        return new Promise((resolve, reject) => {
-          pendingFallback.set(id, { resolve, reject });
-          window.webkit.messageHandlers.ui.postMessage(
-            JSON.stringify({ kind: "rpc", id, data: bytesToB64(pkt) })
-          );
-        });
+      if (args.length > 0 && isCallOptions(args[args.length - 1])) {
+        const opts = args.pop();
+        return invokeWithOptions(method, packArgs(args), opts);
       }
-      return fetch(IPC_BASE + "/rpc", { method: "POST", body: pkt }).then(async (res) => {
-        if (!res.ok) throw new Error("IPC HTTP " + res.status);
-        return decodeRpcResponse(new Uint8Array(await res.arrayBuffer()));
-      });
+      return postRpc(encodeRpcPacket(method, packArgs(args)));
     },
-    send(eventOrMsg, ...args) {
+    stream(method, ...args) {
+      return openStream(method, args);
+    },
+    emit(eventOrMsg, ...args) {
       if (typeof eventOrMsg === "string") {
-        const arg = args.length === 0 ? null : (args.length === 1 ? args[0] : args);
-        sendPacket(encodeSendEvent(eventOrMsg, arg));
+        sendPacket(encodeSendEvent(eventOrMsg, packArgs(args)));
       } else {
         sendPacket(encodeSendMsg(eventOrMsg === undefined ? null : eventOrMsg));
       }
+    },
+    send(eventOrMsg, ...args) {
+      api.emit(eventOrMsg, ...args);
     },
     on(event, fn) {
       if (typeof fn !== "function") throw new TypeError("ipc listener must be a function");
@@ -391,6 +541,16 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
       wrapper._ipcOrig = fn;
       return api.on(key, wrapper);
     },
+    menu: Object.freeze({
+      // Fires when a menu item made with `.emit()` (or "settings") is chosen.
+      on(id, fn) {
+        return api.on("menu:" + id, fn);
+      },
+      // Updates an item of the app menu: { id, title?, enabled?, checked? }.
+      set(update) {
+        return api.invoke("ui:menu.set", update);
+      }
+    }),
     off,
     removeListener: off,
     removeAllListeners(event) {
@@ -422,9 +582,14 @@ pub(crate) const SHIM_JS: &str = r#"(function() {
     return false;
   }
 
+  // The second press of a double click is handled on mousedown, not `dblclick`:
+  // the window drag started by the first press can swallow the click events.
   window.addEventListener("mousedown", function(ev) {
-    if (ev.button !== 0 || ev.detail >= 2) return;
-    if (isDragTarget(ev.target)) {
+    if (ev.button !== 0 || ev.detail > 2) return;
+    if (!isDragTarget(ev.target)) return;
+    if (ev.detail === 2) {
+      sendPacket(new Uint8Array([SEND_OP_TITLEBAR_DOUBLE_CLICK]));
+    } else {
       sendPacket(new Uint8Array([SEND_OP_DRAG]));
     }
   }, true);

@@ -18,7 +18,7 @@ use crate::dialog::{
     FileDialogKind, FileDialogSpec, MessageButtons, MessageDialogSpec, MessageLevel, MessageResult,
 };
 use crate::event::{Event, WindowEvent};
-use crate::menu::{Menu, MenuItem, Mod, Role};
+use crate::menu::{Menu, MenuItem, MenuItemUpdate, Mod, Role};
 use crate::window::{
     Backdrop, Bounds, Display, Tabbing, Theme, TitleBar, WindowId, WindowSpec, WindowState,
 };
@@ -41,13 +41,37 @@ const NSEVENT_TYPE_LEFT_MOUSE_DOWN: usize = 1;
 
 // Native menu action callback table (main thread only; keyed by menu item tag `isize`).
 thread_local! {
-    static MENU_HANDLERS: RefCell<HashMap<isize, Arc<dyn Fn() + Send + Sync>>> = RefCell::new(HashMap::new());
+    static MENU_HANDLERS: RefCell<HashMap<isize, CustomMenuAction>> = RefCell::new(HashMap::new());
+    /// Every built item by id (retained) with its tag, for `MenuItemHandle` updates.
+    static MENU_ITEMS_BY_ID: RefCell<HashMap<String, (Id, isize)>> = RefCell::new(HashMap::new());
     static NEXT_MENU_TAG: RefCell<isize> = const { RefCell::new(1000) };
     static MENU_TARGET: RefCell<Id> = const { RefCell::new(NIL) };
     static LAST_LEFT_DOWN: RefCell<HashMap<usize, Id>> = RefCell::new(HashMap::new());
     static WINDOW_RECORDS: RefCell<HashMap<WindowId, NativeWindowRecord>> = RefCell::new(HashMap::new());
     static NS_TO_WINDOW_ID: RefCell<HashMap<usize, WindowId>> = RefCell::new(HashMap::new());
     static ACTIVE_DELEGATES: RefCell<HashMap<WindowId, WindowCallbacks>> = RefCell::new(HashMap::new());
+}
+
+/// A menu choice the runtime carries out (it needs the focused webview).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MenuCommand {
+    /// An `.emit()` item: `menu:<id>` to the page, `Event::Menu(id)` to the app.
+    Emit(String),
+    /// A webview role such as `Reload` or `ZoomIn`.
+    Role(Role),
+}
+
+#[derive(Clone)]
+struct CustomMenuAction {
+    handler: Option<Arc<dyn Fn() + Send + Sync>>,
+    command: Option<MenuCommand>,
+    enabled: bool,
+}
+
+static MENU_COMMANDS: Mutex<Vec<MenuCommand>> = Mutex::new(Vec::new());
+
+pub(crate) fn drain_menu_commands() -> Vec<MenuCommand> {
+    std::mem::take(&mut *MENU_COMMANDS.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 static APP_SHOULD_QUIT: AtomicBool = AtomicBool::new(false);
@@ -225,10 +249,25 @@ extern "C" fn window_did_resign_key(_: Id, _: Sel, notification: Id) {
 
 extern "C" fn on_custom_menu_item(_: Id, _: Sel, sender: Id) {
     let tag = msg!(isize; sender, "tag");
-    let cb = MENU_HANDLERS.with(|h| h.borrow().get(&tag).cloned());
-    if let Some(cb) = cb {
+    let Some(action) = MENU_HANDLERS.with(|h| h.borrow().get(&tag).cloned()) else {
+        return;
+    };
+    if let Some(cb) = action.handler {
         cb();
     }
+    if let Some(cmd) = action.command {
+        MENU_COMMANDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(cmd);
+    }
+}
+
+/// Keeps `MenuItem::enabled(false)` and `set_enabled` in effect: with
+/// `autoenablesItems`, AppKit asks the target instead of reading `isEnabled`.
+extern "C" fn validate_menu_item(_: Id, _: Sel, item: Id) -> bool {
+    let tag = msg!(isize; item, "tag");
+    MENU_HANDLERS.with(|h| h.borrow().get(&tag).is_none_or(|a| a.enabled))
 }
 
 #[cfg(feature = "cef")]
@@ -369,11 +408,18 @@ fn ensure_classes() -> (Id, Id, Id, Id) {
         let menu_target_cls = define_class(
             "UiMenuTarget",
             "NSObject",
-            &[(
-                "onCustomMenuItem:",
-                on_custom_menu_item as *const c_void,
-                "v@:@",
-            )],
+            &[
+                (
+                    "onCustomMenuItem:",
+                    on_custom_menu_item as *const c_void,
+                    "v@:@",
+                ),
+                (
+                    "validateMenuItem:",
+                    validate_menu_item as *const c_void,
+                    if BOOL_ENC == "c" { "c@:@" } else { "B@:@" },
+                ),
+            ],
             &[],
         );
         (
@@ -782,6 +828,44 @@ pub(crate) fn maximize_window(id: WindowId) {
     }
 }
 
+/// What a title-bar double click should do, from System Settings > Desktop & Dock
+/// ("Double-click a window's title bar to…"), stored in `AppleActionOnDoubleClick`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TitlebarAction {
+    Zoom,
+    Minimize,
+    None,
+}
+
+pub(crate) fn titlebar_action_for(setting: Option<&str>, legacy_minimize: bool) -> TitlebarAction {
+    match setting {
+        Some("Minimize") => TitlebarAction::Minimize,
+        Some("None") => TitlebarAction::None,
+        // "Maximize" (zoom) and "Fill" both zoom the window.
+        Some(_) => TitlebarAction::Zoom,
+        // Older systems only stored the minimize checkbox.
+        None if legacy_minimize => TitlebarAction::Minimize,
+        None => TitlebarAction::Zoom,
+    }
+}
+
+pub(crate) fn titlebar_double_click(id: WindowId) {
+    let defaults = msg!(Id; class("NSUserDefaults"), "standardUserDefaults");
+    let action = if defaults.is_null() {
+        TitlebarAction::Zoom
+    } else {
+        let value = msg!(Id; defaults, "stringForKey:", ns_string("AppleActionOnDoubleClick") => Id);
+        let setting = (!value.is_null()).then(|| rust_string(value));
+        let legacy = msg!(bool; defaults, "boolForKey:", ns_string("AppleMiniaturizeOnDoubleClick") => Id);
+        titlebar_action_for(setting.as_deref(), legacy)
+    };
+    match action {
+        TitlebarAction::Zoom => maximize_window(id),
+        TitlebarAction::Minimize => minimize_window(id),
+        TitlebarAction::None => {}
+    }
+}
+
 pub(crate) fn set_window_fullscreen(id: WindowId, fullscreen: bool) {
     if let Some((ns_win, _, _)) = window_ns_ids(id) {
         let mask = msg!(usize; ns_win, "styleMask");
@@ -900,9 +984,83 @@ const MOD_CONTROL: usize = 1 << 18;
 const MOD_OPTION: usize = 1 << 19;
 const MOD_COMMAND: usize = 1 << 20;
 
+/// The app's display name: `CFBundleName` when bundled, else the process name.
+pub(crate) fn app_name() -> String {
+    let bundle = msg!(Id; class("NSBundle"), "mainBundle");
+    if !bundle.is_null() {
+        for key in ["CFBundleDisplayName", "CFBundleName"] {
+            let v = msg!(Id; bundle, "objectForInfoDictionaryKey:", ns_string(key) => Id);
+            if !v.is_null() && msg!(bool; v, "isKindOfClass:", class("NSString") => Id) {
+                let name = rust_string(v);
+                if !name.is_empty() {
+                    return name;
+                }
+            }
+        }
+    }
+    let info = msg!(Id; class("NSProcessInfo"), "processInfo");
+    rust_string(msg!(Id; info, "processName"))
+}
+
+/// Default role titles that read better with the app's name, as macOS apps do.
+pub(crate) fn role_title_with_app(role: Role, title: &str, app: &str) -> Option<String> {
+    match (role, title) {
+        (Role::About, "About") => Some(format!("About {app}")),
+        (Role::Hide, "Hide") => Some(format!("Hide {app}")),
+        (Role::Quit, "Quit") => Some(format!("Quit {app}")),
+        (Role::Help, "Help") => Some(format!("{app} Help")),
+        _ => None,
+    }
+}
+
+fn next_menu_tag() -> isize {
+    NEXT_MENU_TAG.with(|t| {
+        let mut cur = t.borrow_mut();
+        let v = *cur;
+        *cur += 1;
+        v
+    })
+}
+
+fn native_role_selector(role: Role) -> Option<&'static str> {
+    Some(match role {
+        Role::About => "orderFrontStandardAboutPanel:",
+        Role::Hide => "hide:",
+        Role::HideOthers => "hideOtherApplications:",
+        Role::ShowAll => "unhideAllApplications:",
+        Role::Quit => "terminate:",
+        Role::Undo => "undo:",
+        Role::Redo => "redo:",
+        Role::Cut => "cut:",
+        Role::Copy => "copy:",
+        Role::Paste => "paste:",
+        Role::SelectAll => "selectAll:",
+        Role::Minimize => "performMiniaturize:",
+        Role::Zoom => "performZoom:",
+        Role::BringAllToFront => "arrangeInFront:",
+        Role::CloseWindow => "performClose:",
+        Role::Fullscreen => "toggleFullScreen:",
+        Role::Help => "showHelp:",
+        Role::Services
+        | Role::Settings
+        | Role::Reload
+        | Role::Back
+        | Role::Forward
+        | Role::ActualSize
+        | Role::ZoomIn
+        | Role::ZoomOut
+        | Role::ToggleDevTools => return None,
+    })
+}
+
 pub(crate) fn set_app_menu(menu: &Menu) {
     let (_, _, _, target_cls) = ensure_classes();
     MENU_HANDLERS.with(|h| h.borrow_mut().clear());
+    MENU_ITEMS_BY_ID.with(|m| {
+        for (_, (item, _)) in m.borrow_mut().drain() {
+            release(item);
+        }
+    });
     let menu_target = MENU_TARGET.with(|slot| {
         let mut s = slot.borrow_mut();
         if s.is_null() {
@@ -910,6 +1068,7 @@ pub(crate) fn set_app_menu(menu: &Menu) {
         }
         *s
     });
+    let app = app_name();
 
     let main_menu =
         msg!(Id; msg!(Id; class("NSMenu"), "alloc"), "initWithTitle:", ns_string("MainMenu") => Id);
@@ -923,37 +1082,47 @@ pub(crate) fn set_app_menu(menu: &Menu) {
                     msg!((); sub_menu, "addItem:", sep => Id);
                 }
                 MenuItem::Action {
+                    id,
                     title,
                     shortcut,
                     enabled,
+                    checked,
+                    emit,
                     role,
                     handler,
-                    ..
                 } => {
+                    let title = role
+                        .and_then(|r| role_title_with_app(r, title, &app))
+                        .unwrap_or_else(|| title.clone());
+
+                    if *role == Some(Role::Services) {
+                        let ns_item = msg!(Id; msg!(Id; class("NSMenuItem"), "alloc"), "initWithTitle:action:keyEquivalent:",
+                            ns_string(&title) => Id, std::ptr::null::<c_void>() as Sel => Sel, ns_string("") => Id);
+                        let services = msg!(Id; msg!(Id; class("NSMenu"), "alloc"), "initWithTitle:", ns_string(&title) => Id);
+                        msg!((); ns_item, "setSubmenu:", services => Id);
+                        msg!((); ns_app(), "setServicesMenu:", services => Id);
+                        msg!((); sub_menu, "addItem:", ns_item => Id);
+                        release(services);
+                        release(ns_item);
+                        continue;
+                    }
+
                     let key = shortcut
                         .as_ref()
                         .map(|s| s.key.to_ascii_lowercase())
                         .unwrap_or_default();
-                    let action_sel = match role {
-                        Some(Role::About) => "orderFrontStandardAboutPanel:",
-                        Some(Role::Hide) => "hide:",
-                        Some(Role::HideOthers) => "hideOtherApplications:",
-                        Some(Role::ShowAll) => "unhideAllApplications:",
-                        Some(Role::Quit) => "terminate:",
-                        Some(Role::Undo) => "undo:",
-                        Some(Role::Redo) => "redo:",
-                        Some(Role::Cut) => "cut:",
-                        Some(Role::Copy) => "copy:",
-                        Some(Role::Paste) => "paste:",
-                        Some(Role::SelectAll) => "selectAll:",
-                        Some(Role::Minimize) => "performMiniaturize:",
-                        Some(Role::Zoom) => "performZoom:",
-                        Some(Role::CloseWindow) => "performClose:",
-                        Some(Role::Fullscreen) => "toggleFullScreen:",
-                        None => "onCustomMenuItem:",
+                    let native_sel = role.and_then(native_role_selector);
+                    let command = match role {
+                        Some(Role::Settings) => Some(MenuCommand::Emit(id.clone())),
+                        Some(r) if r.is_webview_role() => Some(MenuCommand::Role(*r)),
+                        Some(_) => None,
+                        None if *emit => Some(MenuCommand::Emit(id.clone())),
+                        None => None,
                     };
+                    let custom = native_sel.is_none() && (handler.is_some() || command.is_some());
+                    let action_sel = native_sel.unwrap_or("onCustomMenuItem:");
                     let ns_item = msg!(Id; msg!(Id; class("NSMenuItem"), "alloc"), "initWithTitle:action:keyEquivalent:",
-                        ns_string(title) => Id, sel(action_sel) => Sel, ns_string(&key) => Id);
+                        ns_string(&title) => Id, sel(action_sel) => Sel, ns_string(&key) => Id);
 
                     if let Some(sc) = shortcut {
                         let mut mask = 0usize;
@@ -972,20 +1141,35 @@ pub(crate) fn set_app_menu(menu: &Menu) {
                         msg!((); ns_item, "setKeyEquivalentModifierMask:", mask => usize);
                     }
                     msg!((); ns_item, "setEnabled:", *enabled => bool);
+                    if *checked {
+                        msg!((); ns_item, "setState:", 1isize => isize);
+                    }
 
-                    if role.is_none()
-                        && let Some(cb) = handler
-                    {
-                        let tag = NEXT_MENU_TAG.with(|t| {
-                            let mut cur = t.borrow_mut();
-                            let v = *cur;
-                            *cur += 1;
-                            v
+                    let tag = if custom {
+                        let tag = next_menu_tag();
+                        MENU_HANDLERS.with(|h| {
+                            h.borrow_mut().insert(
+                                tag,
+                                CustomMenuAction {
+                                    handler: handler.clone(),
+                                    command,
+                                    enabled: *enabled,
+                                },
+                            )
                         });
-                        MENU_HANDLERS.with(|h| h.borrow_mut().insert(tag, cb.clone()));
                         msg!((); ns_item, "setTag:", tag => isize);
                         msg!((); ns_item, "setTarget:", menu_target => Id);
-                    }
+                        tag
+                    } else {
+                        0
+                    };
+                    MENU_ITEMS_BY_ID.with(|m| {
+                        if let Some((old, _)) =
+                            m.borrow_mut().insert(id.clone(), (retain(ns_item), tag))
+                        {
+                            release(old);
+                        }
+                    });
                     msg!((); sub_menu, "addItem:", ns_item => Id);
                     release(ns_item);
                 }
@@ -996,11 +1180,51 @@ pub(crate) fn set_app_menu(menu: &Menu) {
         if sub.title.eq_ignore_ascii_case("Window") {
             msg!((); ns_app(), "setWindowsMenu:", sub_menu => Id);
         }
+        if sub.title.eq_ignore_ascii_case("Help") {
+            msg!((); ns_app(), "setHelpMenu:", sub_menu => Id);
+        }
         release(sub_menu);
         release(top_item);
     }
     msg!((); ns_app(), "setMainMenu:", main_menu => Id);
     release(main_menu);
+}
+
+/// Applies a `MenuItemHandle` / `ipc.menu.set` change to the built menu.
+/// Returns false when no item has that id.
+pub(crate) fn update_menu_item(id: &str, update: &MenuItemUpdate) -> bool {
+    let Some((item, tag)) = MENU_ITEMS_BY_ID.with(|m| m.borrow().get(id).copied()) else {
+        return false;
+    };
+    if let Some(title) = &update.title {
+        msg!((); item, "setTitle:", ns_string(title) => Id);
+    }
+    if let Some(enabled) = update.enabled {
+        msg!((); item, "setEnabled:", enabled => bool);
+        MENU_HANDLERS.with(|h| {
+            if let Some(a) = h.borrow_mut().get_mut(&tag) {
+                a.enabled = enabled;
+            }
+        });
+    }
+    if let Some(checked) = update.checked {
+        msg!((); item, "setState:", isize::from(checked) => isize);
+    }
+    true
+}
+
+/// The window with keyboard focus, if it is one of ours.
+pub(crate) fn key_window_id() -> Option<WindowId> {
+    let key = msg!(Id; ns_app(), "keyWindow");
+    let win = if key.is_null() {
+        msg!(Id; ns_app(), "mainWindow")
+    } else {
+        key
+    };
+    if win.is_null() {
+        return None;
+    }
+    NS_TO_WINDOW_ID.with(|m| m.borrow().get(&(win as usize)).copied())
 }
 
 // ---------------------------------------------------------------------------

@@ -19,6 +19,21 @@ ui::ipc_enum! {
     }
 }
 
+ui::ipc_struct! {
+    #[derive(Debug, Clone, PartialEq)]
+    struct V2Report {
+        added: i64,
+        timed_out: bool,
+        chunks: String,
+        closed_with: i64,
+        misuse: bool,
+        endless: String,
+        menu_found: bool,
+        menu_missing: bool,
+        missing: Option<String>,
+    }
+}
+
 fn check_pure_rust_contracts() {
     // 1. json! and RFC 8259 roundtrip
     let payload = json!({
@@ -126,6 +141,13 @@ struct LiveProbe {
     nav_checked: bool,
     load_finished: bool,
     reserved_scheme_rejected: bool,
+    /// Thread name `invoke_blocking` ran on.
+    blocking_thread: Option<String>,
+    /// `ctx.is_cancelled()` turned true after the page's `{ timeout }` passed.
+    cancel_seen: bool,
+    /// A page-closed stream saw `send` fail and returned.
+    stream_stopped: bool,
+    v2_report: Option<V2Report>,
 }
 
 fn check_live_window_and_webview() {
@@ -162,6 +184,10 @@ fn check_live_window_and_webview() {
         let p_report = probe.clone();
         let p_cmd = probe.clone();
         let p_ev = probe.clone();
+        let p_blocking = probe.clone();
+        let p_cancel = probe.clone();
+        let p_stopped = probe.clone();
+        let p_v2 = probe.clone();
         let app_exit = app.clone();
 
         const HTML: &str = r#"<!doctype html>
@@ -218,6 +244,36 @@ fn check_live_window_and_webview() {
     throw new Error("unexpected binary rpc return bytes: " + Array.from(rawOut));
   }
 
+  // v2 IPC: worker-thread calls, cancellation, streams.
+  const added = await ipc.invoke("slow_add", 2, 3);
+  let timedOut = false;
+  try {
+    await ipc.invoke("wait_cancel", "x", { timeout: 150 });
+  } catch (e) {
+    timedOut = e.name === "TimeoutError";
+  }
+  const chunks = [];
+  const counter = ipc.stream("count", 4);
+  counter.on("data", (b) => chunks.push(b[0]));
+  counter.send(new Uint8Array([40]));
+  const closedWith = await counter.closed;
+  let misuse = false;
+  try {
+    await ipc.invoke("count", 1);
+  } catch (e) {
+    misuse = /is a stream/.test(e.message);
+  }
+  const endless = ipc.stream("until_closed");
+  await new Promise((r) => endless.on("data", r));
+  endless.close();
+  const endlessResult = await endless.closed;
+  const menuFound = await ipc.menu.set({ id: "role:ActualSize", checked: true, enabled: false });
+  const menuMissing = await ipc.menu.set({ id: "no-such-item", enabled: false });
+  ipc.emit("v2_report", {
+    added, timed_out: timedOut, chunks: chunks.join(","), closed_with: closedWith,
+    misuse, endless: endlessResult, menu_found: menuFound, menu_missing: menuMissing,
+  });
+
   ipc.send("bin_upload", new Uint8Array([1, 2, 3, 4]));
   ipc.send("ready");
 }
@@ -257,6 +313,54 @@ boot();"#;
                 let flipped: Vec<u8> = data.0.into_iter().map(|b| b.wrapping_add(1)).collect();
                 (tag, Bytes(flipped))
             })
+            .invoke_blocking("slow_add", move |_ctx, (a, b): (i64, i64)| {
+                std::thread::sleep(Duration::from_millis(30));
+                if let Ok(mut g) = p_blocking.lock() {
+                    g.blocking_thread = std::thread::current().name().map(str::to_owned);
+                }
+                a + b
+            })
+            .invoke_blocking("wait_cancel", move |ctx, _tag: String| {
+                let start = Instant::now();
+                while !ctx.is_cancelled() && start.elapsed() < Duration::from_secs(5) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if let Ok(mut g) = p_cancel.lock() {
+                    g.cancel_seen = ctx.is_cancelled();
+                }
+                "finished"
+            })
+            .invoke_stream("count", |_ctx, n: u8, stream| -> ui::Result<i64> {
+                let mut total = 0i64;
+                for i in 0..n {
+                    stream.send(Bytes(vec![i]))?;
+                    total += i64::from(i);
+                }
+                if let Some(back) = stream.recv() {
+                    total += Bytes::from_ipc(&back).map(|b| i64::from(b.0[0])).unwrap_or(0);
+                }
+                Ok(stream.close_with(total))
+            })
+            .invoke_stream("until_closed", move |_ctx, (), stream| {
+                let start = Instant::now();
+                let mut n = 0u32;
+                while stream.send(n).is_ok() && start.elapsed() < Duration::from_secs(5) {
+                    n += 1;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if let Ok(mut g) = p_stopped.lock() {
+                    g.stream_stopped = stream.is_closed();
+                }
+                "stopped"
+            })
+            .on(
+                "v2_report",
+                move |_ctx, report: V2Report| {
+                    if let Ok(mut g) = p_v2.lock() {
+                        g.v2_report = Some(report);
+                    }
+                },
+            )
             .on("bin_upload", move |_ctx, data: Bytes| {
                 if let Ok(mut g) = p_bin_up.lock() {
                     g.bin_upload_seen = Some(data.0);
@@ -386,6 +490,30 @@ boot();"#;
         g.dom_height
     );
     assert!(g.nav_checked, "on_navigate should have fired");
+    assert!(
+        g.blocking_thread
+            .as_deref()
+            .is_some_and(|n| n.starts_with("ui-invoke:")),
+        "invoke_blocking must run on a worker thread, got {:?}",
+        g.blocking_thread
+    );
+    assert!(g.cancel_seen, "a page timeout must set ctx.is_cancelled()");
+    assert!(g.stream_stopped, "stream.close() must close the Rust side");
+    assert_eq!(
+        g.v2_report,
+        Some(V2Report {
+            added: 5,
+            timed_out: true,
+            chunks: "0,1,2,3".into(),
+            closed_with: 46,
+            misuse: true,
+            endless: "stopped".into(),
+            menu_found: cfg!(target_os = "macos"),
+            menu_missing: false,
+            missing: None,
+        }),
+        "invoke_blocking / timeout / stream results"
+    );
     assert!(g.load_finished, "LoadState::Finished should have fired");
 }
 

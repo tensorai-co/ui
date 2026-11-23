@@ -56,8 +56,8 @@ fn main() -> ui::Result<()> {
         WebView::new()
             .assets("app", serve) // serves app://localhost/index.html with MIME inference
             .inspectable(cfg!(debug_assertions))
-            .rpc("open_project", |ctx, ()| ctx.window().dialog().pick_folder())
-            .rpc("transform", |_ctx, (name, raw): (String, Bytes)| {
+            .invoke("open_project", |ctx, ()| ctx.window().dialog().pick_folder())
+            .invoke("transform", |_ctx, (name, raw): (String, Bytes)| {
                 let flipped: Vec<u8> = raw.0.into_iter().map(|b| !b).collect();
                 (name, Bytes(flipped))
             })
@@ -122,16 +122,78 @@ const folder = await ipc.invoke("open_project");
 const [name, outBytes] = await ipc.invoke("transform", "buf", new Uint8Array([1, 2, 3]));
 // outBytes is a zero-offset Uint8Array backed by the decoded binary payload
 
-// Fire-and-forget renderer -> host messages
-ipc.send("ready");
-ipc.send("upload", arrayBufferOrUint8Array);
-ipc.send({ type: "set_title", title: "Updated Title" }); // dispatches to on_msg::<AppCmd>
+// Slow calls: a trailing { signal, timeout } is call options, not an argument
+const report = await ipc.invoke("export_report", req, { timeout: 600_000, signal });
+
+// Streams: ordered frames from Rust, data back the other way
+const term = ipc.stream("term_open", 24, 80);
+term.on("data", (bytes) => xterm.write(bytes));
+term.send(stdinBytes);
+term.close();                       // Rust's Stream::is_closed() turns true
+const exitCode = await term.closed; // the handler's return value
+
+// Fire-and-forget renderer -> host messages (`send` is the v1 name for `emit`)
+ipc.emit("ready");
+ipc.emit("upload", arrayBufferOrUint8Array);
+ipc.emit({ type: "set_title", title: "Updated Title" }); // dispatches to on_msg::<AppCmd>
+
+// Menu items made with .emit(), and live menu updates
+ipc.menu.on("toggle_panel", () => togglePanel());
+await ipc.menu.set({ id: "toggle_panel", checked: true, enabled: true, title: "Hide Panel" });
 
 // Host -> renderer event subscriptions
 const off = ipc.on("app_info", (info) => console.log(info.version));
 ipc.once("frame", (bytes) => ctxDraw(bytes.buffer));
 ipc.off("app_info", handler); // or off() / ipc.removeListener(...) / ipc.removeAllListeners(...)
 ```
+
+### Slow Calls, Streams & Typed Structs
+
+`.invoke` handlers run on the UI thread and must return quickly. `.invoke_blocking` runs each call on its own worker thread and resolves the page's promise when it returns; `.invoke_stream` adds a `ui::Stream` for ordered frames in both directions. When the page aborts, times out, or closes the stream, `ctx.is_cancelled()` / `stream.is_closed()` turn true.
+
+```rust
+ui::ipc_struct! {
+    struct ExportRequest { path: String, format: String, pages: Option<u32> }
+}
+
+WebView::new()
+    .invoke_blocking("export_report", |ctx, req: ExportRequest| -> ui::Result<String> {
+        for page in 0..req.pages.unwrap_or(1) {
+            if ctx.is_cancelled() { return Err(ui::Error::InvalidState("cancelled".into())); }
+            render(&req.path, page)?;
+        }
+        Ok(req.path)
+    })
+    .invoke_stream("term_open", |_ctx, (rows, cols): (u16, u16), stream| -> ui::Result<i32> {
+        let mut pty = Pty::spawn(rows, cols)?;
+        while !stream.is_closed() {
+            if let Some(input) = stream.try_recv() { pty.write(&Bytes::from_ipc(&input)?.0)?; }
+            stream.send(Bytes(pty.read_chunk()?))?;  // raw binary frames
+        }
+        Ok(stream.close_with(pty.exit_code()))        // resolves `term.closed`
+    })
+```
+
+`ipc_struct!` generates `FromIpc`/`IntoIpc` for a struct sent as a JS object: `Option` fields may be left out, and decode errors name the field (`missing IPC field "path"`).
+
+### Menus
+
+`Menu::standard()` provides App (About, Services, Hide, Quit, with the app's name), Edit, View (Actual Size, Zoom In/Out, Full Screen), Window and Help menus; on macOS the Help menu gets the system search field. Further roles: `Settings`, `Reload`, `Back`, `Forward`, `ToggleDevTools`, `BringAllToFront`, `Help`.
+
+```rust
+use ui::menu::{Menu, MenuItem, Shortcut, Submenu};
+
+app.menu(
+    Menu::standard()
+        .with_settings() // "Settings…" (Cmd+,) emits `menu:settings`
+        .insert_submenu(Submenu::new("Go").item(
+            MenuItem::new("toggle_panel", "Toggle Panel").shortcut(Shortcut::ctrl("`")).emit(),
+        )),
+);
+app.menu_item("toggle_panel").set_checked(true);
+```
+
+An `.emit()` item sends `menu:<id>` to the focused window's webviews (`ipc.menu.on(id, ..)`) and `Event::Menu(id)` to `app.on_event`. Double-clicking a `data-ui-drag` region zooms or minimizes the window, following the macOS "Double-click a window's title bar to…" setting.
 
 ---
 
@@ -155,15 +217,15 @@ UI_BACKEND=webkit cargo test -p ui --test conformance --features cef
 
 ## API Overview
 
-Root `ui::*` re-exports the core surface (`run`, `App`, `SingleInstance`, `Window`, `WebView`, `Ctx`, `TitleBar`, `Backdrop`, `Tabbing`, `Profile`, `Nav`, `NavRequest`, `Request`, `Response`, `Menu`, `Dialog`, `Bytes`, `Value`, `DecodeError`, `FromIpc`, `IntoIpc`, `RpcResult`, `Error`, `Result`, `json!`, `ipc_enum!`), organized into focused submodules:
+Root `ui::*` re-exports the core surface (`run`, `App`, `SingleInstance`, `Window`, `WebView`, `Ctx`, `Stream`, `TitleBar`, `Backdrop`, `Tabbing`, `Profile`, `Nav`, `NavRequest`, `Request`, `Response`, `Menu`, `Dialog`, `Bytes`, `Value`, `DecodeError`, `FromIpc`, `IntoIpc`, `RpcResult`, `Error`, `Result`, `json!`, `ipc_enum!`, `ipc_struct!`), organized into focused submodules:
 
 ```text
 ui
 ├── app        // run, App, SingleInstance
 ├── window     // Window, WindowBuilder, WindowId, TitleBar, Backdrop, Tabbing, Bounds, Display, Theme, WindowState
 ├── webview    // WebView, WebViewBuilder, WebViewId, Ctx, Request, Response, Mime, Nav, NavRequest, Profile, LoadState
-├── ipc        // Bytes, Value, FromIpc, IntoIpc, DecodeError, RpcResult (+ json!, ipc_enum!)
-├── menu       // Menu, Submenu, MenuItem, Role, Shortcut, Mod
+├── ipc        // Bytes, Value, FromIpc, IntoIpc, DecodeError, RpcResult (+ json!, ipc_enum!, ipc_struct!)
+├── menu       // Menu, Submenu, MenuItem, MenuItemHandle, MenuItemUpdate, Role, Shortcut, Mod
 ├── dialog     // Dialog, FileDialog, MessageDialog, Filter, MessageLevel, MessageButtons, MessageResult
 ├── event      // Event, WindowEvent, WebViewEvent
 ├── platform   // RawWindowHandle, RawWebViewHandle
@@ -171,7 +233,7 @@ ui
 ```
 
 - **Thread-safe handles:** `App`, `Window`, and `WebView` are `Clone + Send + Sync` and dispatch safely onto the UI thread when invoked from worker threads.
-- **Typed & binary codecs:** `FromIpc` / `IntoIpc` support primitives, `String`, `Bytes` / `&[u8]` / `&[u8; N]`, `Option<T>`, `Vec<T>`, `PathBuf`, `Value`, and tuples up to 4 elements, enabling `.rpc("slice", |_ctx, (path, a, b): (String, usize, usize)| ...)` and `.rpc("frame", |_ctx, buf: Bytes| ...)` directly in standard Rust.
+- **Typed & binary codecs:** `FromIpc` / `IntoIpc` support primitives, `String`, `Bytes` / `&[u8]` / `&[u8; N]`, `Option<T>`, `Vec<T>`, `PathBuf`, `Value`, tuples up to 4 elements, and structs declared with `ipc_struct!`, enabling `.invoke("slice", |_ctx, (path, a, b): (String, usize, usize)| ...)` and `.invoke("frame", |_ctx, buf: Bytes| ...)` directly in standard Rust. `.rpc` remains as the v1 name for `.invoke`.
 - **Asset MIME detection:** `Response::asset(path, bytes)` maps common web extensions (`html`/`htm`, `js`/`mjs`, `css`, `wasm`, `svg`, `png`, `jpg`/`jpeg`, `gif`, `webp`, `ico`, `woff`, `woff2`, `ttf`, `otf`, `json`/`map`, `txt`, `mp3`, `mp4`, `webm`) via `Mime::from_path`.
 
 ---
@@ -199,7 +261,9 @@ Renderer and host communication runs over the reserved `ui-ipc://ipc/` custom sc
 ```text
 Renderer -> Host
   ipc.invoke(method, arg) ──▶ POST ui-ipc://ipc/rpc   ──▶ UI thread .rpc(..)      ──▶ ArrayBuffer reply
-  ipc.send(ev, arg)       ──▶ POST ui-ipc://ipc/send  ──▶ UI thread .on/.on_msg   ──▶ 200 OK
+  ipc.invoke(.., {signal}) ─▶ POST ui-ipc://ipc/rpc (+call id) ─▶ worker .invoke_blocking ─▶ reply via UI thread
+  ipc.stream(method, ..)  ──▶ POST ui-ipc://ipc/rpc (+call id, stream) ─▶ worker .invoke_stream ─▶ frames on __ui_stream:<id>
+  ipc.emit(ev, arg)       ──▶ POST ui-ipc://ipc/send  ──▶ UI thread .on/.on_msg   ──▶ 200 OK
 
 Host -> Renderer (queued + coalesced)
   ctx.emit / wv.emit      ──▶ push frame to per-webview queue ──▶ empty->non-empty: window.__ipc_wake()
@@ -208,6 +272,7 @@ Host -> Renderer (queued + coalesced)
   ipc.on / ipc.once       ◀── dispatch decoded batch          ◀── POST ui-ipc://ipc/drain
 ```
 
+- **Calls with an id:** an RPC packet whose flags byte sets bit 0 carries a `u32` call id (bit 1 marks a stream). `/send` opcodes `0x05` (cancel) and `0x06` (stream data) address that id. Stream frames and the final `{ ok }` / `{ error }` frame travel through the same event queue, so they arrive in order.
 - **Binary wire framing:** Each payload begins with a 1-byte tag (`0x00` Null, `0x01` UTF-8 JSON, `0x02` raw bytes, `0x03` Array, `0x04` Object). `ui::Bytes` / `&[u8]` values decode as zero-offset `Uint8Array` views without base64 encoding, and mixed tuples/objects pack structured JSON alongside binary buffers.
 - **Coalesced event delivery:** Host `emit` only invokes `window.__ipc_wake()` when transitioning a webview's queue from empty to non-empty; burst events drain together in one `/drain` roundtrip. Registering the first JS listener triggers a microtask drain for boot-time events.
 - **Reserved scheme & HTTPS fallback:** `"ui-ipc"` cannot be registered via `WebViewBuilder::assets`. On `https://` pages under `webkit` where custom-scheme `fetch` is blocked as mixed content, the runtime automatically sends and receives identical binary frames via `WKScriptMessageHandler`.
