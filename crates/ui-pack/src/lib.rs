@@ -1,193 +1,148 @@
-//! Release bundler and signer (`ui-pack`) for `.app`, Mac App Store `.pkg`, Windows MSIX, and Linux bundles.
+//! `ui-pack`: packaging and the dev loop for `ui` apps.
+//!
+//! Packaging is [packager](https://github.com/tensorai-co/packager)'s: `ui-pack pack` reads
+//! `[package.metadata.packager]` from the app's `Cargo.toml` and builds `.app`, `.dmg`, `.pkg`,
+//! `.msi`, `.msix`, `.deb` and `.snap` packages through it, adding what a `ui` app needs on top
+//! (the Chromium Embedded Framework and its helper apps for `backend = "cef"`). `run` and
+//! `gen-ts` are the dev loop.
 
 pub mod cli;
-pub mod linux;
-pub mod macos;
 pub mod metadata;
+pub mod pack;
 pub mod run;
-pub mod update;
-pub mod windows;
 
 #[cfg(test)]
 mod tests {
-    use super::linux::render_desktop_entry;
-    use super::macos::{
-        MacChannel, MacPackOptions, pack_macos_app, render_info_plist, render_sandbox_entitlements,
-    };
-    use super::metadata::{AppMetadata, BackendTarget};
-    use super::windows::render_appx_manifest;
+    use super::metadata::{BackendTarget, UiMetadata};
 
     #[test]
-    fn url_schemes_documents_and_entitlements() {
-        let meta = AppMetadata::parse(
-            "[package]\nname = \"notes\"\n[package.metadata.ui]\nbundle_id = \"com.example.notes\"\n\
-             url_schemes = [\"notes\", \"notes-dev\"]\ndocument_types = [\"md\", \".txt\"]\n\
-             entitlements = \"app.entitlements\"\nicon = \"assets/AppIcon.icns\"\n",
+    fn reads_ui_metadata() {
+        let meta = UiMetadata::parse(
+            "[package]\nname = \"my-app\"\nversion = \"0.4.2\"\n\n[package.metadata.ui]\n\
+             backend = \"cef\"\ndev_command = \"npm run dev\"\ndev_url = \"http://localhost:3000\"\n",
         )
         .unwrap();
-        assert_eq!(meta.url_schemes, ["notes", "notes-dev"]);
-        assert_eq!(meta.document_types, ["md", ".txt"]);
-        assert_eq!(meta.entitlements.as_deref(), Some("app.entitlements"));
-
-        let plist = render_info_plist(&meta, "notes");
-        assert!(plist.contains("<key>CFBundleURLSchemes</key>"));
-        assert!(plist.contains("<string>notes-dev</string>"));
-        assert!(plist.contains("<key>CFBundleTypeExtensions</key>"));
-        assert!(
-            plist.contains("<string>txt</string>"),
-            "leading dot stripped"
-        );
-        assert!(plist.contains("<key>CFBundleIconFile</key>\n  <string>AppIcon.icns</string>"));
-        let speechy = AppMetadata::parse(
-            "[package]\nname = \"d\"\n[package.metadata.ui]\nmicrophone_usage = \"Dictation\"\nspeech_usage = \"Turns speech into text\"\n",
-        )
-        .unwrap();
-        let p2 = render_info_plist(&speechy, "d");
-        assert!(
-            p2.contains("<key>NSMicrophoneUsageDescription</key>\n  <string>Dictation</string>")
-        );
-        assert!(p2.contains("<key>NSSpeechRecognitionUsageDescription</key>"));
-
-        let appx = render_appx_manifest(&meta, "notes.exe", "CN=Example");
-        assert!(appx.contains(r#"<uap:Protocol Name="notes" />"#));
-        assert!(appx.contains("<uap:FileType>.md</uap:FileType>"));
-        assert!(
-            render_desktop_entry(&meta, "notes")
-                .contains("MimeType=x-scheme-handler/notes;x-scheme-handler/notes-dev;")
-        );
-    }
-
-    #[test]
-    fn inline_entitlements_and_notarize_commands() {
-        let meta = AppMetadata::parse(
-            "[package]\nname = \"vm\"\n[package.metadata.ui.entitlements]\n\
-             \"com.apple.security.hypervisor\" = true\n\"com.apple.security.cs.allow-jit\" = false\n",
-        )
-        .unwrap();
-        assert_eq!(
-            meta.entitlement_keys,
-            [
-                ("com.apple.security.hypervisor".to_owned(), true),
-                ("com.apple.security.cs.allow-jit".to_owned(), false)
-            ]
-        );
-        let path = super::macos::entitlements_path(&meta).expect("inline entitlements written");
-        let plist = std::fs::read_to_string(&path).unwrap();
-        assert!(plist.contains("<key>com.apple.security.hypervisor</key>\n  <true/>"));
-        assert!(plist.contains("<key>com.apple.security.cs.allow-jit</key>\n  <false/>"));
-        let _ = std::fs::remove_file(path);
-
-        let cmds = super::macos::notarize_commands(std::path::Path::new("/o/My App.app"), "prof");
-        assert_eq!(cmds[0][..4], ["ditto", "-c", "-k", "--keepParent"]);
-        assert_eq!(cmds[1][..3], ["xcrun", "notarytool", "submit"]);
-        assert!(cmds[1].ends_with(&["--keychain-profile".into(), "prof".into(), "--wait".into()]));
-        assert_eq!(cmds[2], ["xcrun", "stapler", "staple", "/o/My App.app"]);
-    }
-
-    #[test]
-    fn parses_package_metadata_ui() {
-        let toml = r#"
-[package]
-name = "my-app"
-version = "0.4.2"
-
-[package.metadata.ui]
-name = "My App"
-bundle_id = "com.example.myapp"
-backend = "webkit"
-"#;
-        let meta = AppMetadata::parse(toml).unwrap();
         assert_eq!(meta.crate_name, "my-app");
-        assert_eq!(meta.display_name, "My App");
-        assert_eq!(meta.version, "0.4.2");
-        assert_eq!(meta.bundle_id, "com.example.myapp");
-        assert_eq!(meta.backend, BackendTarget::WebKit);
+        assert_eq!(meta.backend, BackendTarget::Cef);
+        assert_eq!(meta.dev_command.as_deref(), Some("npm run dev"));
+        assert_eq!(meta.dev_url.as_deref(), Some("http://localhost:3000"));
+        let plain = UiMetadata::parse("[package]\nname = \"x\"\n").unwrap();
+        assert_eq!(plain.backend, BackendTarget::Auto);
     }
 
     #[test]
-    fn generates_platform_manifests_and_enforces_mas_rule() {
-        let meta = AppMetadata::parse(
-            "[package]\nname = \"demo\"\n[package.metadata.ui]\nbackend = \"cef\"\nbundle_id = \"com.example.demo\"\n",
-        )
-        .unwrap();
-        let plist = render_info_plist(&meta, "demo");
-        assert!(plist.contains("<string>com.example.demo</string>"));
-        assert!(render_sandbox_entitlements().contains("com.apple.security.app-sandbox"));
-        assert!(render_appx_manifest(&meta, "demo.exe", "CN=Example").contains("0.1.0.0"));
-        assert!(render_desktop_entry(&meta, "demo").contains("Exec=demo %U"));
-
-        let err = pack_macos_app(
-            &meta,
-            &MacPackOptions {
-                binary_path: std::path::PathBuf::from("nonexistent"),
-                output_dir: std::env::temp_dir(),
-                channel: MacChannel::AppStore,
-                cef_framework: None,
-                sign: None,
-                notarize: None,
-            },
+    fn points_moved_packaging_keys_at_packager() {
+        let err = UiMetadata::parse(
+            "[package]\nname = \"x\"\n[package.metadata.ui]\nbundle_id = \"com.example.x\"\n",
         )
         .unwrap_err();
-        assert!(err.contains("Mac App Store"));
+        assert!(
+            err.contains("[package.metadata.packager.app] identifier"),
+            "{err}"
+        );
+        assert!(
+            UiMetadata::parse("[package]\nname = \"x\"\n[package.metadata.ui]\nbackend = \"qt\"\n")
+                .is_err()
+        );
     }
 
+    /// A CEF app's `.app` carries the framework and the helpers next to the binary, the helpers
+    /// taking the app's identifier, all signed by packager.
+    #[cfg(target_os = "macos")]
     #[test]
-    fn packages_direct_macos_cef_bundle_with_preserved_symlinks() {
-        let root = std::env::temp_dir().join(format!("ui-pack-cef-test-{}", std::process::id()));
+    fn packs_cef_framework_and_helpers() {
+        use std::path::Path;
+        let root = std::env::temp_dir().join(format!("ui-pack-cef-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let stage = root.join("stage");
-        let bin = stage.join("demo");
-        let fw = stage.join("Chromium Embedded Framework.framework");
-        let helper_contents = stage.join("ui Helper.app/Contents");
-        let helper_macos = helper_contents.join("MacOS");
-        std::fs::create_dir_all(fw.join("Versions/A")).unwrap();
-        std::fs::write(fw.join("Versions/A/Chromium Embedded Framework"), b"libcef").unwrap();
-        #[cfg(unix)]
+        let release = root.join("target/release");
+        // Any Mach-O executable will do as the app, framework and helper binaries.
+        let exe = std::env::current_exe().unwrap();
+        let bundle = |dir: &Path, exe_name: &str, id: &str, kind: &str| {
+            let contents = if kind == "FMWK" {
+                dir.join("Versions/A/Resources")
+            } else {
+                dir.join("Contents")
+            };
+            std::fs::create_dir_all(&contents).unwrap();
+            let bin_dir = if kind == "FMWK" {
+                dir.join("Versions/A")
+            } else {
+                dir.join("Contents/MacOS")
+            };
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            std::fs::copy(&exe, bin_dir.join(exe_name)).unwrap();
+            std::fs::write(
+                contents.join("Info.plist"),
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+                     <key>CFBundleExecutable</key><string>{exe_name}</string>\
+                     <key>CFBundleIdentifier</key><string>{id}</string>\
+                     <key>CFBundlePackageType</key><string>{kind}</string></dict></plist>\n"
+                ),
+            )
+            .unwrap();
+        };
+        let fw = release.join("Chromium Embedded Framework.framework");
+        bundle(
+            &fw,
+            "Chromium Embedded Framework",
+            "org.cef.framework",
+            "FMWK",
+        );
+        std::os::unix::fs::symlink("A", fw.join("Versions/Current")).unwrap();
         std::os::unix::fs::symlink(
-            "Versions/A/Chromium Embedded Framework",
+            "Versions/Current/Chromium Embedded Framework",
             fw.join("Chromium Embedded Framework"),
         )
         .unwrap();
-        std::fs::create_dir_all(&helper_macos).unwrap();
-        std::fs::write(helper_macos.join("ui Helper"), b"helper").unwrap();
+        std::os::unix::fs::symlink("Versions/Current/Resources", fw.join("Resources")).unwrap();
+        bundle(
+            &release.join("ui Helper (GPU).app"),
+            "ui Helper (GPU)",
+            "org.ui.cef",
+            "APPL",
+        );
+        std::fs::copy(&exe, release.join("demo")).unwrap();
         std::fs::write(
-            helper_contents.join("Info.plist"),
-            "<dict><key>CFBundleIdentifier</key><string>org.ui.cef</string></dict>",
-        )
-        .unwrap();
-        std::fs::write(&bin, b"demo-bin").unwrap();
-
-        let meta = AppMetadata::parse(
-            "[package]\nname = \"demo\"\n[package.metadata.ui]\nbackend = \"cef\"\nbundle_id = \"com.example.demo\"\n",
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n\n[package.metadata.ui]\nbackend = \"cef\"\n\n\
+             [package.metadata.packager.app]\nidentifier = \"com.example.demo\"\n\n[package.metadata.packager.package.app]\n",
         )
         .unwrap();
 
-        let out_dir = root.join("out");
-        let app = pack_macos_app(
+        let manifest = root.join("Cargo.toml");
+        let meta = UiMetadata::from_manifest(&manifest).unwrap();
+        let packages = super::pack::pack(
             &meta,
-            &MacPackOptions {
-                binary_path: bin,
-                output_dir: out_dir,
-                channel: MacChannel::Direct,
-                cef_framework: None,
-                sign: None,
-                notarize: None,
+            &super::pack::PackOptions {
+                manifest,
+                only: Some(vec!["app".into()]),
+                out_dir: Some(root.join("out")),
+                binaries: vec![release.join("demo")],
+                build: false,
+                notarize: false,
             },
         )
         .unwrap();
-
-        let bundled_helper_plist = std::fs::read_to_string(
-            app.join("Contents/Frameworks/ui Helper.app/Contents/Info.plist"),
+        let app = packages[0].path();
+        let helper_plist = std::fs::read_to_string(
+            app.join("Contents/Frameworks/ui Helper (GPU).app/Contents/Info.plist"),
         )
         .unwrap();
-        assert!(bundled_helper_plist.contains("<string>com.example.demo</string>"));
-        #[cfg(unix)]
-        {
-            let link_meta =
-                std::fs::symlink_metadata(app.join("Contents/Frameworks/Chromium Embedded Framework.framework/Chromium Embedded Framework"))
-                    .unwrap();
-            assert!(link_meta.file_type().is_symlink());
-        }
+        assert!(
+            helper_plist.contains("<string>com.example.demo</string>"),
+            "{helper_plist}"
+        );
+        let link = app.join(
+            "Contents/Frameworks/Chromium Embedded Framework.framework/Chromium Embedded Framework",
+        );
+        assert!(
+            std::fs::symlink_metadata(link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        packager::sign::bundle::verify_bundle(app).unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 }

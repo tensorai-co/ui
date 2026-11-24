@@ -1,66 +1,77 @@
-//! Minimal pure-Rust parser for `[package]` and `[package.metadata.ui]` in `Cargo.toml`.
+//! The `ui` keys in `Cargo.toml`: `[package] name` and `[package.metadata.ui]` (`backend`,
+//! `dev_command`, `dev_url`). Packaging is configured in `[package.metadata.packager]` and read
+//! by packager.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+use packager::format::toml::{self, Toml};
+
+/// The webview backend the app is built for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackendTarget {
+    /// Whatever the platform defaults to.
     #[default]
     Auto,
+    /// The system WebKit (macOS).
     WebKit,
+    /// Chromium Embedded Framework: packages carry the framework and its helper apps.
     Cef,
 }
 
-/// Application packaging metadata read from `[package]` and `[package.metadata.ui]`.
+/// What `ui-pack` needs to know about the app besides its packaging.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppMetadata {
+pub struct UiMetadata {
+    /// `[package] name`: the binary `run`, `gen-ts` and `pack` build.
     pub crate_name: String,
-    pub display_name: String,
-    pub version: String,
-    pub bundle_id: String,
-    pub icon: Option<String>,
+    /// `backend`.
     pub backend: BackendTarget,
-    pub category: String,
-    pub min_macos: String,
-    /// URL schemes the app handles, e.g. `["myapp"]` for `myapp://…` links.
-    pub url_schemes: Vec<String>,
-    /// File extensions the app opens, e.g. `["md", "txt"]`.
-    pub document_types: Vec<String>,
-    /// Entitlements plist (relative to the manifest) used when signing.
-    pub entitlements: Option<String>,
-    /// Inline `[package.metadata.ui.entitlements]` keys, used when no file is named.
-    pub entitlement_keys: Vec<(String, bool)>,
-    /// `NSMicrophoneUsageDescription`: why the app uses the microphone.
-    pub microphone_usage: Option<String>,
-    /// `NSSpeechRecognitionUsageDescription`: why the app uses speech recognition.
-    pub speech_usage: Option<String>,
-    /// Command that starts the web dev server for `ui-pack run --dev`.
+    /// `dev_command`: starts the web dev server for `ui-pack run --dev`.
     pub dev_command: Option<String>,
-    /// The dev server's URL for `ui-pack run --dev` (default `http://localhost:5173`).
+    /// `dev_url`: the dev server's URL for `ui-pack run --dev` (default `http://localhost:5173`).
     pub dev_url: Option<String>,
-    /// Folder holding the manifest; relative paths above resolve against it.
+    /// The folder holding the manifest.
     pub manifest_dir: PathBuf,
 }
 
-/// Parses a one-line TOML string array (`["a", "b"]`) or a single string.
-fn parse_list(raw: &str) -> Vec<String> {
-    let raw = raw.trim();
-    let inner = raw
-        .strip_prefix('[')
-        .and_then(|r| r.strip_suffix(']'))
-        .unwrap_or(raw);
-    inner
-        .split(',')
-        .map(|v| v.trim().trim_matches('"').trim().to_owned())
-        .filter(|v| !v.is_empty())
-        .collect()
-}
+/// Packaging keys `[package.metadata.ui]` used to take, and where they live now.
+const MOVED: [(&str, &str); 10] = [
+    ("name", "[package.metadata.packager.app] name"),
+    ("bundle_id", "[package.metadata.packager.app] identifier"),
+    ("icon", "[package.metadata.packager.app] icon"),
+    ("url_schemes", "[package.metadata.packager.app] url_schemes"),
+    (
+        "document_types",
+        "[package.metadata.packager.app] file_types",
+    ),
+    (
+        "category",
+        "[package.metadata.packager.package.app] category",
+    ),
+    (
+        "min_macos",
+        "[package.metadata.packager.package.app] min_macos",
+    ),
+    (
+        "entitlements",
+        "[package.metadata.packager.sign.apple] entitlements",
+    ),
+    (
+        "microphone_usage",
+        "[package.metadata.packager.package.app.info_plist] NSMicrophoneUsageDescription",
+    ),
+    (
+        "speech_usage",
+        "[package.metadata.packager.package.app.info_plist] NSSpeechRecognitionUsageDescription",
+    ),
+];
 
-impl AppMetadata {
+impl UiMetadata {
+    /// Reads a `Cargo.toml`.
     pub fn from_manifest(path: &Path) -> Result<Self, String> {
         let src = fs::read_to_string(path)
             .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-        let mut meta = Self::parse(&src)?;
+        let mut meta = Self::parse(&src).map_err(|e| format!("{}: {e}", path.display()))?;
         meta.manifest_dir = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -68,106 +79,44 @@ impl AppMetadata {
         Ok(meta)
     }
 
-    pub fn parse(toml_src: &str) -> Result<Self, String> {
-        let mut crate_name = String::new();
-        let mut version = String::from("0.1.0");
-        let mut display_name = None;
-        let mut bundle_id = None;
-        let mut icon = None;
-        let mut backend = BackendTarget::Auto;
-        let mut category = String::from("public.app-category.developer-tools");
-        let mut min_macos = String::from("13.0");
-        let mut url_schemes = Vec::new();
-        let mut document_types = Vec::new();
-        let mut entitlements = None;
-        let mut entitlement_keys = Vec::new();
-        let mut dev_command = None;
-        let mut microphone_usage = None;
-        let mut speech_usage = None;
-        let mut dev_url = None;
-
-        let mut section = String::new();
-        for raw_line in toml_src.lines() {
-            let line = raw_line.split('#').next().unwrap_or("").trim();
-            if line.is_empty() {
-                continue;
-            }
-            if line.starts_with('[') && line.ends_with(']') {
-                section = line[1..line.len() - 1].trim().to_owned();
-                continue;
-            }
-            if let Some((k, v)) = line.split_once('=') {
-                let key = k.trim();
-                let raw = v.trim();
-                let val = raw.trim_matches('"').to_owned();
-                match section.as_str() {
-                    "package" => match key {
-                        "name" => crate_name = val,
-                        "version" if !val.starts_with('{') => version = val,
-                        _ => {}
-                    },
-                    "package.metadata.ui" => match key {
-                        "name" => display_name = Some(val),
-                        "bundle_id" => bundle_id = Some(val),
-                        "icon" => icon = Some(val),
-                        "category" => category = val,
-                        "min_macos" => min_macos = val,
-                        "url_schemes" => url_schemes = parse_list(raw),
-                        "document_types" => document_types = parse_list(raw),
-                        "entitlements" => entitlements = Some(val),
-                        "dev_command" => dev_command = Some(val),
-                        "microphone_usage" => microphone_usage = Some(val),
-                        "speech_usage" => speech_usage = Some(val),
-                        "dev_url" => dev_url = Some(val),
-                        "backend" => {
-                            backend = match val.as_str() {
-                                "webkit" => BackendTarget::WebKit,
-                                "cef" => BackendTarget::Cef,
-                                _ => BackendTarget::Auto,
-                            };
-                        }
-                        _ => {}
-                    },
-                    "package.metadata.ui.entitlements" => {
-                        entitlement_keys.push((key.trim_matches('"').to_owned(), val == "true"));
-                    }
-                    _ => {}
-                }
+    /// Parses a `Cargo.toml`'s text.
+    pub fn parse(src: &str) -> Result<Self, String> {
+        let root = toml::parse(src)?;
+        let package = root.get("package").ok_or("missing [package] table")?;
+        let crate_name = package
+            .get("name")
+            .and_then(Toml::as_str)
+            .ok_or("missing `[package] name`")?
+            .to_owned();
+        let empty = Toml::Table(Default::default());
+        let ui = package
+            .get("metadata")
+            .and_then(|m| m.get("ui"))
+            .unwrap_or(&empty);
+        for (key, now) in MOVED {
+            if ui.get(key).is_some() {
+                return Err(format!(
+                    "`[package.metadata.ui] {key}` is packaging, which packager does now: \
+                     move it to {now}"
+                ));
             }
         }
-
-        if crate_name.is_empty() {
-            return Err("missing `[package] name` in Cargo.toml".into());
-        }
-        let disp = display_name.unwrap_or_else(|| crate_name.clone());
-        let default_bid = format!(
-            "com.example.{}",
-            crate_name
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() {
-                    c.to_ascii_lowercase()
-                } else {
-                    '-'
-                })
-                .collect::<String>()
-        );
+        let text = |k: &str| ui.get(k).and_then(Toml::as_str).map(String::from);
+        let backend = match text("backend").as_deref() {
+            None | Some("auto") => BackendTarget::Auto,
+            Some("webkit") => BackendTarget::WebKit,
+            Some("cef") => BackendTarget::Cef,
+            Some(other) => {
+                return Err(format!(
+                    "`[package.metadata.ui] backend = \"{other}\"`: expected webkit or cef"
+                ));
+            }
+        };
         Ok(Self {
             crate_name,
-            display_name: disp,
-            version,
-            bundle_id: bundle_id.unwrap_or(default_bid),
-            icon,
             backend,
-            category,
-            min_macos,
-            url_schemes,
-            document_types,
-            entitlements,
-            entitlement_keys,
-            dev_command,
-            dev_url,
-            microphone_usage,
-            speech_usage,
+            dev_command: text("dev_command"),
+            dev_url: text("dev_url"),
             manifest_dir: PathBuf::from("."),
         })
     }

@@ -5,8 +5,8 @@
 //! UI_DEV_URL=http://localhost:5173 cargo run -p embedded-app   # load a dev server instead
 //! ```
 //!
-//! Packaged with `ui-pack macos`, it also handles `uiembedded://…` links and
-//! `.uidoc` files (see `[package.metadata.ui]`), printing them as they arrive.
+//! Packaged with `ui-pack pack`, it also handles `uiembedded://…` links and
+//! `.uidoc` files (see `[package.metadata.packager]`), printing them as they arrive.
 //! Set `UI_EVENT_LOG=<file>` to append them to a file as well.
 
 use std::io::Write;

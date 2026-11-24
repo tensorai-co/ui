@@ -6,11 +6,14 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-[package.metadata.ui]
+# Packaging, read by packager (`ui-pack pack`).
+[package.metadata.packager.app]
 name = "Embedded App"
-bundle_id = "dev.ui.embedded-app"
+identifier = "dev.ui.embedded-app"
 url_schemes = ["uiembedded"]
-document_types = ["uidoc"]
+file_types = [{ extension = "uidoc", name = "Embedded App document" }]
+
+[package.metadata.packager.package.app]
 
 [dependencies]
 ui = { path = "../../crates/ui" }

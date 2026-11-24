@@ -1,15 +1,18 @@
-//! `ui-pack run` (build, sign, launch) and `ui-pack icons` (iconset + .icns).
+//! The dev loop: `ui-pack run` (build, sign, launch) and `ui-pack gen-ts`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
-use crate::macos::{codesign, entitlements_path};
-use crate::metadata::AppMetadata;
+use packager::sign::apple::{CodeSignOptions, sign_macho};
+
+use crate::metadata::UiMetadata;
 
 /// Options for [`run`].
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
+    /// The app's `Cargo.toml`.
     pub manifest: PathBuf,
+    /// Build with `--release`.
     pub release: bool,
     /// Start `dev_command` and point the app at `dev_url` via `UI_DEV_URL`.
     pub dev: bool,
@@ -17,23 +20,26 @@ pub struct RunOptions {
     pub app_args: Vec<String>,
 }
 
-/// Builds the package's binary, signs it ad hoc with the manifest's
-/// entitlements (macOS), and runs it, returning its exit code. With `dev`, the
-/// web dev server runs alongside and `UI_DEV_URL` points the app at it.
-pub fn run(meta: &AppMetadata, opts: &RunOptions) -> Result<i32, String> {
+/// Builds the package's binary, signs it ad hoc with the entitlements from
+/// `[package.metadata.packager.sign.apple]` (macOS), and runs it, returning its exit code.
+/// With `dev`, the web dev server runs alongside and `UI_DEV_URL` points the app at it.
+pub fn run(meta: &UiMetadata, opts: &RunOptions) -> Result<i32, String> {
     let bin = cargo_build(&opts.manifest, &meta.crate_name, opts.release)?;
+    // The packaging config is optional for running; it supplies entitlements and the icon.
+    let packaging = packager::config::from_cargo_manifest(&opts.manifest).ok();
     if cfg!(target_os = "macos")
-        && let Some(ent) = entitlements_path(meta)
+        && let Some(cfg) = &packaging
+        && let Some(entitlements) = cfg.apple.as_ref().and_then(|a| a.entitlements.clone())
     {
-        codesign(&bin, "-", Some(&ent))?;
+        sign_ad_hoc(&bin, &cfg.app.identifier, entitlements)?;
     }
 
     let mut dev_server: Option<Child> = None;
     let mut cmd = Command::new(&bin);
     cmd.args(&opts.app_args);
     // Unbundled binaries show a generic Dock icon; point them at the app's.
-    if let Some(icon) = &meta.icon {
-        cmd.env("UI_DOCK_ICON", meta.manifest_dir.join(icon));
+    if let Some(icon) = packaging.as_ref().and_then(|c| c.app.icon.as_ref()) {
+        cmd.env("UI_DOCK_ICON", icon);
     }
     if opts.dev {
         let url = meta
@@ -56,9 +62,18 @@ pub fn run(meta: &AppMetadata, opts: &RunOptions) -> Result<i32, String> {
     Ok(status?.code().unwrap_or(1))
 }
 
+/// Signs a binary ad hoc with entitlements, in place (what `codesign -s - --entitlements` does).
+fn sign_ad_hoc(bin: &Path, identifier: &str, entitlements: Vec<u8>) -> Result<(), String> {
+    let data = std::fs::read(bin).map_err(|e| format!("{}: {e}", bin.display()))?;
+    let mut opts = CodeSignOptions::ad_hoc(identifier);
+    opts.entitlements = Some(entitlements);
+    let signed = sign_macho(&data, &opts).map_err(|e| format!("sign {}: {e}", bin.display()))?;
+    std::fs::write(bin, signed.data).map_err(|e| format!("{}: {e}", bin.display()))
+}
+
 /// Builds the app and runs it with `UI_GEN_TS=<out>`, so its
 /// `ui::write_typescript_if_requested(..)` writes the `ipc_types!` declarations.
-pub fn gen_ts(meta: &AppMetadata, manifest: &Path, out: &Path) -> Result<PathBuf, String> {
+pub fn gen_ts(meta: &UiMetadata, manifest: &Path, out: &Path) -> Result<PathBuf, String> {
     let bin = cargo_build(manifest, &meta.crate_name, false)?;
     let out = if out.is_absolute() {
         out.to_path_buf()
@@ -98,7 +113,7 @@ fn shell(cmd: &str, cwd: &Path) -> Result<Child, String> {
 }
 
 /// Runs `cargo build` for the package and returns the built binary's path.
-fn cargo_build(manifest: &Path, bin_name: &str, release: bool) -> Result<PathBuf, String> {
+pub fn cargo_build(manifest: &Path, bin_name: &str, release: bool) -> Result<PathBuf, String> {
     let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     cmd.args([
         "build",
@@ -142,53 +157,6 @@ fn executable_of(line: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// Icon sizes in a macOS `.iconset`: (file name, pixel size).
-pub const ICONSET_SIZES: [(&str, u32); 10] = [
-    ("icon_16x16.png", 16),
-    ("icon_16x16@2x.png", 32),
-    ("icon_32x32.png", 32),
-    ("icon_32x32@2x.png", 64),
-    ("icon_128x128.png", 128),
-    ("icon_128x128@2x.png", 256),
-    ("icon_256x256.png", 256),
-    ("icon_256x256@2x.png", 512),
-    ("icon_512x512.png", 512),
-    ("icon_512x512@2x.png", 1024),
-];
-
-/// Makes `<out>/AppIcon.iconset/` and `<out>/AppIcon.icns` from one large PNG
-/// (1024x1024 recommended) with the system `sips` and `iconutil` tools.
-pub fn make_icons(source: &Path, out_dir: &Path) -> Result<PathBuf, String> {
-    let iconset = out_dir.join("AppIcon.iconset");
-    std::fs::create_dir_all(&iconset).map_err(|e| format!("create {}: {e}", iconset.display()))?;
-    for (name, px) in ICONSET_SIZES {
-        let px = px.to_string();
-        let status = Command::new("sips")
-            .args(["-s", "format", "png", "-z", &px, &px])
-            .arg(source)
-            .arg("--out")
-            .arg(iconset.join(name))
-            .stdout(std::process::Stdio::null())
-            .status()
-            .map_err(|e| format!("run sips: {e}"))?;
-        if !status.success() {
-            return Err(format!("sips could not resize {}", source.display()));
-        }
-    }
-    let icns = out_dir.join("AppIcon.icns");
-    let status = Command::new("iconutil")
-        .args(["-c", "icns"])
-        .arg(&iconset)
-        .arg("-o")
-        .arg(&icns)
-        .status()
-        .map_err(|e| format!("run iconutil: {e}"))?;
-    if !status.success() {
-        return Err("iconutil failed".into());
-    }
-    Ok(icns)
 }
 
 #[cfg(test)]

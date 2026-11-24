@@ -2,8 +2,8 @@
 //! because WKWebView doesn't implement the Web Speech API.
 //!
 //! Needs an app bundle whose Info.plist has `NSMicrophoneUsageDescription` and
-//! `NSSpeechRecognitionUsageDescription` (`microphone_usage` / `speech_usage`
-//! in `[package.metadata.ui]`), plus the `com.apple.security.device.audio-input`
+//! `NSSpeechRecognitionUsageDescription` (in `[package.metadata.packager.package.app.info_plist]`),
+//! plus the `com.apple.security.device.audio-input`
 //! entitlement when signed with the hardened runtime. Without the usage strings
 //! macOS would kill the app, so [`listen`] returns an error instead.
 
@@ -59,7 +59,7 @@ pub fn check_usage_strings() -> Result<()> {
         Ok(())
     } else {
         Err(Error::InvalidState(format!(
-            "speech needs an app bundle whose Info.plist has {} (set microphone_usage / speech_usage in [package.metadata.ui])",
+            "speech needs an app bundle whose Info.plist has {} (set them in [package.metadata.packager.package.app.info_plist])",
             missing.join(" and ")
         )))
     }

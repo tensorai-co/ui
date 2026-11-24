@@ -1,7 +1,7 @@
 //! Signed update checks: fetch a small JSON feed, verify its ECDSA P-256
 //! signature against the app's embedded public key, and compare versions.
 //!
-//! Feed format (written by `ui-pack update-feed`):
+//! Feed format (written by `packager update-feed`):
 //!
 //! ```json
 //! { "payload": "{\"version\":\"1.2.0\",\"url\":\"https://…/App.zip\",\"notes\":\"…\"}",
@@ -26,7 +26,7 @@ pub struct UpdateInfo {
 /// Fetches `feed_url`, verifies it with `public_key`, and returns the update
 /// if its version is newer than `current_version` (e.g. `env!("CARGO_PKG_VERSION")`).
 ///
-/// `public_key` is the base64 printed by `ui-pack update-key` (an uncompressed
+/// `public_key` is the base64 printed by `packager update-key` (an uncompressed
 /// P-256 point). Only `https://` feeds are fetched (`http://localhost` too, for
 /// testing). Blocks while fetching: call it from a worker thread or `invoke_blocking`.
 pub fn check(

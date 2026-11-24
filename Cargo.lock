@@ -11,6 +11,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "packager"
+version = "0.1.0"
+source = "git+https://github.com/tensorai-co/packager#fd694947276d90275927a96cd738327d555a0808"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -87,6 +92,9 @@ version = "0.1.0"
 [[package]]
 name = "ui-pack"
 version = "0.1.0"
+dependencies = [
+ "packager",
+]
 
 [[package]]
 name = "unicode-ident"

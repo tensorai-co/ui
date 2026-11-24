@@ -96,7 +96,7 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    /// Signs with the system `openssl`, the way `ui-pack update-feed` does.
+    /// Signs with the system `openssl`, independently of packager, which writes feeds.
     #[test]
     fn verifies_openssl_signatures_and_rejects_tampering() {
         let dir = std::env::temp_dir().join(format!("ui-sec-test-{}", std::process::id()));

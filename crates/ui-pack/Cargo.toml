@@ -1,8 +1,9 @@
 [package]
 name = "ui-pack"
-description = "Zero-dependency desktop application bundle packager for ui apps"
-keywords = ["bundler", "macos", "desktop", "webview"]
+description = "Packaging and the dev loop for ui apps: packages through packager, `run` and `gen-ts`"
+keywords = ["packaging", "installer", "desktop", "webview"]
 categories = ["development-tools"]
+default-run = "ui-pack"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +13,9 @@ homepage.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+packager = { git = "https://github.com/tensorai-co/packager" }
 
 [[bin]]
 name = "ui-pack"

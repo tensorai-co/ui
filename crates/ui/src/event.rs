@@ -17,7 +17,7 @@ pub enum Event {
     /// A menu item made with `.emit()` (or `Role::Settings`, as `"settings"`) was chosen.
     Menu(String),
     /// The app was asked to open a URL with one of its schemes (`url_schemes` in
-    /// `[package.metadata.ui]`), e.g. a browser sign-in redirect.
+    /// `[package.metadata.packager.app]`), e.g. a browser sign-in redirect.
     OpenUrl(String),
     /// Files were opened with the app (Finder, Dock icon drop, `open -a`).
     OpenFiles(Vec<std::path::PathBuf>),

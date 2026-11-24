@@ -18,7 +18,7 @@ ui = { git = "https://github.com/tensorai-co/ui" }
 # ui = { git = "https://github.com/tensorai-co/ui", features = ["cef"] }
 ```
 
-To install the application bundler CLI (`ui-pack`):
+To install `ui-pack`, the CLI for packaging (through [packager](https://github.com/tensorai-co/packager)) and the dev loop:
 
 ```sh
 cargo install --git https://github.com/tensorai-co/ui ui-pack
@@ -196,8 +196,8 @@ fn main() -> ui::Result<()> {
 ### Signed Update Checks
 
 ```sh
-ui-pack update-key --out keys/          # keys/update-private.pem (keep secret) + the public key to embed
-ui-pack update-feed keys/update-private.pem 1.3.0 https://example.com/App-1.3.0.zip "Release notes" > feed.json
+packager update-key --out keys/          # keys/update-private.pem (keep secret) + the public key to embed
+packager update-feed keys/update-private.pem 1.3.0 https://example.com/App-1.3.0.zip "Release notes" > feed.json
 ```
 
 ```rust
@@ -206,11 +206,11 @@ if let Some(update) = ui::update::check("https://example.com/feed.json", PUBLIC_
 }
 ```
 
-Feeds are ECDSA P-256 signed and verified with the system Security framework (macOS), so there's no crypto dependency; only `https://` feeds are fetched.
+Feeds are ECDSA P-256 signed by [packager](https://github.com/tensorai-co/packager) and verified with the system Security framework (macOS), so there's no crypto dependency; only `https://` feeds are fetched.
 
 ### Speech to Text (macOS)
 
-WKWebView has no Web Speech API, so `ui::macos::speech` provides one: `speech::request_permission(..)`, then `speech::listen(Some("en-US"), |t| …)` delivers partial and final transcripts until the session is stopped. Pages use `ui.speech.listen()` (a stream of `{ text, final }`) with `StandardRpcs::none().speech()`. It needs an app bundle with `microphone_usage` and `speech_usage` set in `[package.metadata.ui]` (and the `com.apple.security.device.audio-input` entitlement under the hardened runtime); without them it returns an error instead of letting macOS kill the app.
+WKWebView has no Web Speech API, so `ui::macos::speech` provides one: `speech::request_permission(..)`, then `speech::listen(Some("en-US"), |t| …)` delivers partial and final transcripts until the session is stopped. Pages use `ui.speech.listen()` (a stream of `{ text, final }`) with `StandardRpcs::none().speech()`. It needs an app bundle with `NSMicrophoneUsageDescription` and `NSSpeechRecognitionUsageDescription` set in `[package.metadata.packager.package.app.info_plist]` (and the `com.apple.security.device.audio-input` entitlement under the hardened runtime); without them it returns an error instead of letting macOS kill the app.
 
 ### Optional `serde` Support
 
@@ -223,9 +223,9 @@ ui = { git = "https://github.com/tensorai-co/ui", features = ["serde"] }
 ### Deep Links, Opened Files & Single Instance
 
 ```toml
-[package.metadata.ui]
-url_schemes = ["myapp"]          # myapp://… links (Info.plist, MSIX protocol, Linux MimeType)
-document_types = ["md", "txt"]   # files opened from Finder or dropped on the Dock icon
+[package.metadata.packager.app]
+url_schemes = ["myapp"]                                    # myapp://… links (Info.plist, MSIX, MSI, Linux MimeType)
+file_types = [{ extension = "md", name = "Markdown document" }]   # files opened from Finder or dropped on the Dock icon
 ```
 
 ```rust
@@ -424,28 +424,42 @@ ui
 
 ## Packaging (`ui-pack`)
 
-`ui-pack` reads `[package]` and `[package.metadata.ui]` (`name`, `bundle_id`, `icon`, `backend`, `category`, `min_macos`) from `Cargo.toml`:
-
-```sh
-cargo run -p ui-pack -- macos --manifest path/to/Cargo.toml --bin target/release/my-app --out target/pack [--sign "Developer ID Application: …"]
-cargo run -p ui-pack -- run --manifest path/to/Cargo.toml [--release] [--dev]   # build, sign with entitlements, launch
-cargo run -p ui-pack -- icons assets/app-icon.png                              # AppIcon.iconset + AppIcon.icns
-cargo ui run --dev                                                             # same commands via the cargo-ui binary
-cargo ui gen-ts --out web/src/ipc.d.ts                                         # TypeScript for ipc_types!
-```
-
-Notarize a Developer ID build with `ui-pack macos --sign "Developer ID Application: …" --notarize <keychain-profile>` (zips, submits with `notarytool --wait`, staples). Entitlements can also be inline:
+Packaging is done by [packager](https://github.com/tensorai-co/packager), which builds and signs `.app`, `.dmg`, `.pkg`, `.msi`, `.msix`, `.deb` and `.snap` packages from any host, with no platform tools. Its configuration goes in the app's `Cargo.toml` under `[package.metadata.packager]` (the same tables as a `packager.toml`; name, version and description default to the crate's, and the binary to its release build):
 
 ```toml
-[package.metadata.ui.entitlements]
-"com.apple.security.hypervisor" = true
+[package.metadata.packager.app]
+name = "My App"
+identifier = "com.example.myapp"
+icon = "assets/icon.png"                  # .icns, .ico and Linux icons are generated
+url_schemes = ["myapp"]
+
+[package.metadata.packager.package.app]
+category = "public.app-category.productivity"
+info_plist = { NSMicrophoneUsageDescription = "For voice notes." }
+
+[package.metadata.packager.package.dmg]
+[package.metadata.packager.package.msi]
+
+[package.metadata.packager.sign.apple]
+identity = "Developer ID Application"    # "-" signs ad hoc
+hardened_runtime = true
+entitlements = { "com.apple.security.cs.allow-jit" = true }   # or a plist path
+
+[package.metadata.packager.notarize]
+key = "AuthKey_ABCDE12345.p8"             # App Store Connect API key
 ```
 
-`[package.metadata.ui]` also takes `url_schemes`, `document_types`, `entitlements = "app.entitlements"` (used to sign `macos` bundles and `run` binaries, and as the Mac App Store entitlements), and `dev_command` / `dev_url` for `ui-pack run --dev`, which starts the web dev server and sets `UI_DEV_URL`. An `icon` ending in `.icns` is copied into the bundle, and `ui-pack run` shows it in the Dock for the unbundled binary (`UI_DOCK_ICON`).
+`[package.metadata.ui]` keeps only what `ui` itself needs: `backend` (`webkit` or `cef`) and `dev_command` / `dev_url` for `ui-pack run --dev`.
 
-- **`macos`**: Assembles `<DisplayName>.app`; for `backend = "cef"`, bundles `Chromium Embedded Framework.framework` and helper `.app` processes inside `Contents/Frameworks/` with `CFBundleIdentifier` aligned to `bundle_id`.
-- **`mac-app-store`** (alias `mas`): Builds a sandboxed Mac App Store `.app` + `entitlements.mas.plist` (`com.apple.security.app-sandbox`) using the system webview (`backend = "cef"` is rejected).
-- **`msix` / `linux`**: Generates Windows `AppxManifest.xml` or Linux `.desktop` manifests.
+```sh
+cargo ui pack                               # cargo build --release, then every configured package
+cargo ui pack --only app,dmg --out dist     # just these
+cargo ui pack --bin target/x86_64-pc-windows-msvc/release/my-app.exe --only msi   # a cross-compiled binary
+cargo ui run --dev                          # build, sign with the entitlements, launch next to the dev server
+cargo ui gen-ts --out web/src/ipc.d.ts      # TypeScript for ipc_types!
+```
+
+`ui-pack pack` adds what a `ui` app needs on top of packager: with `backend = "cef"` the `.app` carries `Chromium Embedded Framework.framework` and the `ui Helper*.app` processes from next to the binary, the helpers taking the app's identifier, all signed inside out. `ui-pack run` signs the dev binary ad hoc with the configured entitlements and shows the app's icon in the Dock (`UI_DOCK_ICON`). Mac App Store packages aren't available yet (they're on packager's list).
 
 ---
 
@@ -480,7 +494,7 @@ Host -> Renderer (queued + coalesced)
 | :--- | :--- | :--- |
 | **`webkit` (default on macOS)** | Implemented & verified live (`AppKit` + `WKWebView` via C-ABI `libobjc`) | N/A |
 | **`cef` (`--features cef`)** | Implemented & verified live (Spotify CEF `156.0.30`, Alloy `NSView`, multi-process `ui Helper*.app`) | `ui-cef-sys` resolves/verifies archives and generates `CEF_API_HASH`; host windowing & loader stubs return `Unsupported` |
-| **`ui-pack`** | `.app` and Mac App Store (`mas`) packaging (`ditto` framework staging + entitlements) | `msix` (`AppxManifest.xml`) and `linux` (`.desktop`) generators |
+| **`ui-pack`** | `.app`, `.dmg`, `.pkg` through packager, with the CEF framework and helpers for `cef` apps | `.msi`, `.msix`, `.deb`, `.snap` through packager (built from any host) |
 
 ### Backend Feature Matrix
 
@@ -523,7 +537,7 @@ ui/
     │       └── conformance.rs  # Shared pure-Rust + live window/webview conformance suite (harness = false)
     ├── ui-build/               # build.rs helper: embeds a web build for ui::embedded!(), runs the web build
     ├── ui-cef-sys/             # cef.lock + Spotify CEF fetcher, C11 helper bundler, cef_api_hash check, raw C-API FFI
-    └── ui-pack/                # .app / MAS entitlements assembler & MSIX / .desktop manifest generators
+    └── ui-pack/                # `cargo ui pack` (packaging through packager, CEF bundling), run, gen-ts
 packages/
 └── ui-client/                  # npm package: typed window.ipc, isNative/platform, ui.* standard calls
 examples/
