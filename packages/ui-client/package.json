@@ -13,7 +13,7 @@
   },
   "files": ["index.js", "index.d.ts"],
   "sideEffects": false,
-  "license": "Apache-2.0",
+  "license": "MIT",
   "scripts": {
     "test": "node --test test/"
   }

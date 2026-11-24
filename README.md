@@ -512,7 +512,7 @@ Host -> Renderer (queued + coalesced)
 ```text
 ui/
 ├── Cargo.toml                  # Workspace root (edition 2024, resolver 3, zero external crates)
-├── LICENSE                     # Apache-2.0 license
+├── LICENSE                     # MIT license
 └── crates/
     ├── ui/
     │   ├── examples/
@@ -534,4 +534,4 @@ examples/
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Licensed under the [MIT License](LICENSE). © 2026 Netangular Technologies, Inc.
