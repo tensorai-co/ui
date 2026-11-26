@@ -15,6 +15,9 @@ fn main() {
     const NAME: &str = "ui-test-restore-state";
     ui::macos::forget_window_state(NAME);
 
+    /// A window's content width, height and center.
+    type Measure = (u32, u32, i32, i32);
+
     #[derive(Debug, Default)]
     struct Probe {
         first: Option<ui::window::Bounds>,
@@ -26,6 +29,9 @@ fn main() {
         second_instance: Option<Vec<String>>,
         second_acquire_was_none: bool,
         zoom_restored: Option<f64>,
+        /// Before and after `set_size_centered`.
+        centered: Option<(Measure, Measure)>,
+        pixel_scale: Option<f64>,
     }
     let probe = Arc::new(Mutex::new(Probe::default()));
     let out = probe.clone();
@@ -57,6 +63,43 @@ fn main() {
             probe.lock().unwrap().zoom_restored = Some(b.zoom());
             b.set_zoom(1.0); // leave the test profile at 100%
             zw.close();
+        }
+
+        // A fixed-size window grows about its center into a resizable one.
+        {
+            let sw = Window::new("size-centered")
+                .size(400, 300)
+                .min_size(400, 300)
+                .max_size(400, 300)
+                .resizable(false)
+                .title_bar(TitleBar::overlay(48))
+                .open(app)?;
+            let measure = |b: ui::window::Bounds| -> Measure {
+                (
+                    b.width,
+                    b.height,
+                    b.x + b.width as i32 / 2,
+                    b.y + b.height as i32 / 2,
+                )
+            };
+            let before = measure(sw.bounds());
+            sw.set_max_size(None);
+            sw.set_min_size(Some((480, 360)));
+            sw.set_resizable(true);
+            sw.set_size_centered(600, 420, false);
+            probe.lock().unwrap().centered = Some((before, measure(sw.bounds())));
+
+            // A pixel view over part of it: placed, sized at the window's scale, drawn into, focused, closed.
+            let view = ui::PixelView::new(&sw, |_| {}).expect("a pixel view");
+            view.set_frame(300.0, 0.0, 300.0, 420.0);
+            let scale = view.scale();
+            view.resize((300.0 * scale) as i32, (420.0 * scale) as i32, 0x202020);
+            view.draw(0, 0, 2, 2, vec![0xff0000; 4]);
+            view.set_cursor("text");
+            view.focus();
+            probe.lock().unwrap().pixel_scale = Some(scale);
+            view.close();
+            sw.close();
         }
 
         // 1. Options at open time, then toggled at runtime.
@@ -143,6 +186,18 @@ fn main() {
         g.zoom_restored,
         Some(1.25),
         "zoom restored for the same profile"
+    );
+    assert!(g.pixel_scale.is_some_and(|s| s >= 1.0), "a pixel view's scale: {:?}", g.pixel_scale);
+    let (before, after) = g.centered.expect("set_size_centered ran");
+    assert_eq!((before.0, before.1), (400, 300));
+    assert_eq!(
+        (after.0, after.1),
+        (600, 420),
+        "resized past the old max size"
+    );
+    assert!(
+        (after.2 - before.2).abs() <= 1 && (after.3 - before.3).abs() <= 1,
+        "kept its center: {before:?} -> {after:?}"
     );
     assert!(
         g.second_acquire_was_none,

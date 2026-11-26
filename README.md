@@ -160,6 +160,26 @@ win.macos().set_level(WindowLevel::Floating);
 
 Native context menus are also available from Rust: `window.popup_menu(vec![ContextMenuItem::new("rename", "Rename")], x, y)` returns the chosen id.
 
+### Native Pixel Views & Window Sizes
+
+For what the page shouldn't draw itself at native speed (a virtual machine's screen, a video, a game), a `PixelView`
+sits over part of the window, where the page leaves room: the app places it in the page's CSS pixels, draws into it
+from any thread at the window's backing scale, and hears the mouse, wheel, keys (by W3C `KeyboardEvent.code`) and focus
+over it on the main thread. macOS for now.
+
+```rust
+let view = ui::PixelView::new(&win, |event| println!("{event:?}"))?;
+view.set_frame(800.0, 48.0, 480.0, 600.0);           // from the page's layout, as it moves
+let scale = view.scale();                             // 2.0 on a Retina screen
+view.resize((480.0 * scale) as i32, (600.0 * scale) as i32, 0x202020);
+view.draw(0, 0, w, h, pixels);                        // 0x00RRGGBB, just what changed
+view.set_cursor("text");
+```
+
+A window's size limits and resizability change while it's open (`set_min_size`, `set_max_size`, `set_resizable`), and
+`set_size_centered(w, h, animate)` grows or shrinks it about its center, kept on its screen: an app's small sign-in
+window becoming its main one.
+
 ### Notifications
 
 ```rust

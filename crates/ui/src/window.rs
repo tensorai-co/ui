@@ -336,6 +336,42 @@ impl Window {
         self.runtime.set_window_size(self.id, width, height);
     }
 
+    /// Resizes the content area to `width`×`height` about the window's center
+    /// (where [`set_size`](Self::set_size) keeps the top-left corner), shrunk and
+    /// moved as needed to stay on its screen. With `animate`, macOS animates the
+    /// change, as when an app grows from a sign-in window into its main window.
+    /// Does nothing to a full-screen window.
+    pub fn set_size_centered(&self, width: u32, height: u32, animate: bool) {
+        self.runtime
+            .set_window_size_centered(self.id, width, height, animate);
+    }
+
+    /// The smallest content size the user can resize the window to, as with
+    /// [`WindowBuilder::min_size`]; `None` removes the limit. It doesn't resize
+    /// the window itself.
+    pub fn set_min_size(&self, size: Option<(u32, u32)>) {
+        self.runtime.set_window_min_size(self.id, size);
+    }
+
+    /// The largest content size the user can resize the window to, as with
+    /// [`WindowBuilder::max_size`]; `None` removes the limit. It doesn't resize
+    /// the window itself.
+    pub fn set_max_size(&self, size: Option<(u32, u32)>) {
+        self.runtime.set_window_max_size(self.id, size);
+    }
+
+    /// Whether the user can resize the window, as with
+    /// [`WindowBuilder::resizable`]. On macOS a fixed-size window's zoom button
+    /// is disabled.
+    pub fn set_resizable(&self, resizable: bool) {
+        self.runtime.set_window_resizable(self.id, resizable);
+    }
+
+    /// Centers the window on its screen.
+    pub fn center(&self) {
+        self.runtime.center_window(self.id);
+    }
+
     pub fn bounds(&self) -> Bounds {
         self.runtime.window_bounds(self.id)
     }

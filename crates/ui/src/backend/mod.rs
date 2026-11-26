@@ -8,6 +8,8 @@ pub(crate) mod macos_notify;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_objc;
 #[cfg(target_os = "macos")]
+pub(crate) mod macos_pixel_view;
+#[cfg(target_os = "macos")]
 pub(crate) mod macos_security;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_webkit;
@@ -834,6 +836,66 @@ impl Runtime {
                 macos_appkit::set_window_size(id, width, height);
             }));
         }
+    }
+
+    /// Runs `f` on the main thread: now when already there, otherwise queued.
+    fn on_main(self: &Arc<Self>, f: impl FnOnce() + Send + 'static) {
+        if self.is_main() {
+            f();
+        } else {
+            self.dispatch_on_main(Box::new(f));
+        }
+    }
+
+    pub fn set_window_size_centered(
+        self: &Arc<Self>,
+        id: WindowId,
+        width: u32,
+        height: u32,
+        animate: bool,
+    ) {
+        self.on_main(move || {
+            #[cfg(target_os = "macos")]
+            macos_appkit::set_window_size_centered(id, width, height, animate);
+            #[cfg(not(target_os = "macos"))]
+            let _ = (id, width, height, animate);
+        });
+    }
+
+    pub fn set_window_min_size(self: &Arc<Self>, id: WindowId, size: Option<(u32, u32)>) {
+        self.on_main(move || {
+            #[cfg(target_os = "macos")]
+            macos_appkit::set_window_min_size(id, size);
+            #[cfg(not(target_os = "macos"))]
+            let _ = (id, size);
+        });
+    }
+
+    pub fn set_window_max_size(self: &Arc<Self>, id: WindowId, size: Option<(u32, u32)>) {
+        self.on_main(move || {
+            #[cfg(target_os = "macos")]
+            macos_appkit::set_window_max_size(id, size);
+            #[cfg(not(target_os = "macos"))]
+            let _ = (id, size);
+        });
+    }
+
+    pub fn set_window_resizable(self: &Arc<Self>, id: WindowId, resizable: bool) {
+        self.on_main(move || {
+            #[cfg(target_os = "macos")]
+            macos_appkit::set_window_resizable(id, resizable);
+            #[cfg(not(target_os = "macos"))]
+            let _ = (id, resizable);
+        });
+    }
+
+    pub fn center_window(self: &Arc<Self>, id: WindowId) {
+        self.on_main(move || {
+            #[cfg(target_os = "macos")]
+            macos_appkit::center_window(id);
+            #[cfg(not(target_os = "macos"))]
+            let _ = id;
+        });
     }
 
     pub fn window_bounds(self: &Arc<Self>, id: WindowId) -> Bounds {

@@ -1023,6 +1023,109 @@ pub(crate) fn set_window_size(id: WindowId, width: u32, height: u32) {
     }
 }
 
+/// `NSWindowStyleMaskFullScreen`.
+const MASK_FULL_SCREEN: usize = 1 << 14;
+
+pub(crate) fn set_window_size_centered(id: WindowId, width: u32, height: u32, animate: bool) {
+    let Some(ns_win) = ns_window_for(id) else {
+        return;
+    };
+    if msg!(usize; ns_win, "styleMask") & MASK_FULL_SCREEN != 0 {
+        return;
+    }
+    let cur = rect_of(ns_win, "frame");
+    let content = rect_for(ns_win, "contentRectForFrameRect:", cur);
+    // The frame around the new content size: same title bar and borders.
+    let mut size = rect_for(
+        ns_win,
+        "frameRectForContentRect:",
+        Rect {
+            origin: content.origin,
+            size: Size {
+                width: f64::from(width),
+                height: f64::from(height),
+            },
+        },
+    )
+    .size;
+    let mut origin = Point {
+        x: cur.origin.x + (cur.size.width - size.width) / 2.0,
+        y: cur.origin.y + (cur.size.height - size.height) / 2.0,
+    };
+    let screen = msg!(Id; ns_win, "screen");
+    if !screen.is_null() {
+        let area = rect_of(screen, "visibleFrame");
+        size.width = size.width.min(area.size.width);
+        size.height = size.height.min(area.size.height);
+        origin.x = origin
+            .x
+            .clamp(area.origin.x, area.origin.x + area.size.width - size.width);
+        origin.y = origin.y.clamp(
+            area.origin.y,
+            area.origin.y + area.size.height - size.height,
+        );
+    }
+    let frame = Rect {
+        origin: Point {
+            x: origin.x.round(),
+            y: origin.y.round(),
+        },
+        size,
+    };
+    msg!((); ns_win, "setFrame:display:animate:", frame => Rect, true => bool, animate => bool);
+}
+
+pub(crate) fn set_window_min_size(id: WindowId, size: Option<(u32, u32)>) {
+    if let Some(ns_win) = ns_window_for(id) {
+        let (width, height) = size.map_or((0.0, 0.0), |(w, h)| (f64::from(w), f64::from(h)));
+        msg!((); ns_win, "setContentMinSize:", Size { width, height } => Size);
+    }
+}
+
+pub(crate) fn set_window_max_size(id: WindowId, size: Option<(u32, u32)>) {
+    if let Some(ns_win) = ns_window_for(id) {
+        // AppKit's "no limit" is FLT_MAX.
+        let none = f64::from(f32::MAX);
+        let (width, height) = size.map_or((none, none), |(w, h)| (f64::from(w), f64::from(h)));
+        msg!((); ns_win, "setContentMaxSize:", Size { width, height } => Size);
+    }
+}
+
+pub(crate) fn set_window_resizable(id: WindowId, resizable: bool) {
+    let Some((ns_win, title_bar, native_layout)) = WINDOW_RECORDS.with(|r| {
+        r.borrow()
+            .get(&id)
+            .map(|rec| (rec.ns_window, rec.title_bar, rec.native_controls_layout))
+    }) else {
+        return;
+    };
+    let mask = msg!(usize; ns_win, "styleMask");
+    let next = if resizable {
+        mask | MASK_RESIZABLE
+    } else {
+        mask & !MASK_RESIZABLE
+    };
+    if next == mask {
+        return;
+    }
+    msg!((); ns_win, "setStyleMask:", next => usize);
+    // A new style mask lays the title bar out again: put the controls back.
+    if let TitleBar::Overlay {
+        height,
+        window_controls: traffic_lights,
+    } = title_bar
+        && !(native_layout && traffic_lights.is_none())
+    {
+        position_traffic_lights(ns_win, height, traffic_lights);
+    }
+}
+
+pub(crate) fn center_window(id: WindowId) {
+    if let Some(ns_win) = ns_window_for(id) {
+        msg!((); ns_win, "center");
+    }
+}
+
 pub(crate) fn window_bounds(id: WindowId) -> Bounds {
     if let Some((ns_win, _, _)) = window_ns_ids(id) {
         return ns_window_bounds(ns_win);

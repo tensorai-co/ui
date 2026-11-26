@@ -10,6 +10,7 @@ pub mod ipc;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod menu;
+pub mod pixel_view;
 pub mod platform;
 #[cfg(feature = "serde")]
 mod serde_ipc;
@@ -28,6 +29,7 @@ pub use dialog::Dialog;
 pub use error::{Error, Result};
 pub use ipc::{Bytes, DecodeError, FromIpc, IntoIpc, RpcResult, Value};
 pub use menu::Menu;
+pub use pixel_view::{PixelButton, PixelEvent, PixelView};
 #[cfg(feature = "serde")]
 pub use serde_ipc::Serde;
 pub use standard::StandardRpcs;
